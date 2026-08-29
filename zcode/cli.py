@@ -22,6 +22,17 @@ from zcode.credentials import delete_api_key, prompt_and_save_api_key
 from zcode.core.context import ContextManager
 from zcode.core.controller import AgentController
 from zcode.core.plan import PlanManager
+from zcode.core.session import (
+    DEFAULT_NAME_SOURCE,
+    DERIVED_NAME_SOURCE,
+    USER_NAME_SOURCE,
+    SessionCorrupt,
+    SessionSnapshot,
+    SessionStore,
+    clean_session_name,
+    derive_session_name,
+    plan_to_records,
+)
 from zcode.core.types import AgentState, ToolCall
 from zcode.llm.deepseek import DeepSeekProvider
 from zcode.tools.defaults import build_default_registry
@@ -34,6 +45,11 @@ HELP = """[bold]Commands[/bold]
 /plan  Show the current plan
 /diff  Show changes made by the current task
 /undo  Restore files changed by the current task
+/new [name]  Create a new conversation session
+/sessions  List sessions in this workspace
+/switch <id>  Switch to a session
+/session  Show the current session
+/rename <name>  Rename the current session
 !cmd   Run a shell command directly (PowerShell on Windows)
 /exit  Exit ZCode
 """
@@ -43,6 +59,11 @@ SLASH_COMMANDS = {
     "/plan": "Show the current plan",
     "/diff": "Show current-task changes",
     "/undo": "Restore current-task changes",
+    "/new": "Create a new conversation session",
+    "/sessions": "List workspace sessions",
+    "/switch": "Switch to a session",
+    "/session": "Show current session",
+    "/rename": "Rename the current session",
     "/exit": "Exit ZCode",
 }
 
@@ -176,6 +197,24 @@ async def run_cli(args: argparse.Namespace) -> int:
 
     workspace = Workspace(settings.workspace)
     plan = PlanManager()
+    session_store = SessionStore(workspace.root)
+    try:
+        active_session = session_store.load_active()
+    except SessionCorrupt as exc:
+        console.print(f"[yellow]Ignoring corrupt saved session: {exc}[/yellow]")
+        active_session = None
+    if active_session is None:
+        active_session = session_store.create()
+
+    def restore_workspace_state(snapshot: SessionSnapshot) -> None:
+        workspace.cwd = workspace.root
+        if snapshot.cwd != ".":
+            try:
+                workspace.change_directory(snapshot.cwd)
+            except (OSError, ValueError):
+                snapshot.cwd = "."
+
+    restore_workspace_state(active_session)
     provider = DeepSeekProvider(settings)
     tools = build_default_registry(
         workspace,
@@ -197,6 +236,20 @@ async def run_cli(args: argparse.Namespace) -> int:
         context=context,
         events=renderer,
     )
+    controller.restore_session(active_session.messages, active_session.plan)
+
+    def save_current_session() -> None:
+        active_session.cwd = workspace.cwd_relative
+        active_session.messages = [
+            message
+            for message in controller.context.messages
+            if message.role.value != "system"
+        ]
+        active_session.plan = plan_to_records(plan.steps)
+        try:
+            session_store.save(active_session, active=True)
+        except OSError as exc:
+            console.print(f"[yellow]Could not save session: {exc}[/yellow]")
 
     history_dir = workspace.root / ".zcode"
     history_dir.mkdir(exist_ok=True)
@@ -258,6 +311,7 @@ async def run_cli(args: argparse.Namespace) -> int:
         if not value:
             continue
         if value == "/exit":
+            save_current_session()
             break
         if value == "/help":
             console.print(HELP)
@@ -274,6 +328,69 @@ async def run_cli(args: argparse.Namespace) -> int:
                 console.print("[green]Restored:[/green] " + ", ".join(restored))
             else:
                 console.print("[dim]No current-task changes to restore.[/dim]")
+            continue
+        if value == "/session":
+            console.print(
+                f"Session {active_session.session_id} · {active_session.name} · "
+                f"cwd: {workspace.cwd_relative}"
+            )
+            continue
+        if value == "/sessions":
+            summaries = session_store.list()
+            if not summaries:
+                console.print("[dim]No sessions in this workspace.[/dim]")
+            else:
+                for summary in summaries:
+                    marker = "*" if summary.session_id == active_session.session_id else " "
+                    console.print(
+                        f"{marker} {summary.session_id} · {summary.name} · "
+                        f"cwd: {summary.cwd} · updated: {summary.updated_at}"
+                    )
+            continue
+        if value == "/rename" or value.startswith("/rename "):
+            requested_name = value[7:].strip()
+            if not requested_name:
+                console.print("[yellow]Usage: /rename <name>[/yellow]")
+                continue
+            try:
+                active_session.name = clean_session_name(requested_name)
+            except ValueError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
+                continue
+            active_session.name_source = USER_NAME_SOURCE
+            save_current_session()
+            console.print(f"[green]Session renamed: {active_session.name}[/green]")
+            continue
+        if value == "/new" or value.startswith("/new "):
+            save_current_session()
+            requested_name = value[4:].strip() or None
+            try:
+                active_session = session_store.create(requested_name)
+            except ValueError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
+                continue
+            workspace.cwd = workspace.root
+            controller.reset_session()
+            renderer.state_changed(AgentState.READY, plan)
+            console.print(f"[green]New session: {active_session.session_id} · {active_session.name}[/green]")
+            continue
+        if value == "/switch" or value.startswith("/switch "):
+            session_id = value[7:].strip()
+            if not session_id:
+                console.print("[yellow]Usage: /switch <session-id>[/yellow]")
+                continue
+            try:
+                target_session = session_store.load(session_id)
+            except (FileNotFoundError, SessionCorrupt, ValueError) as exc:
+                console.print(f"[red]Could not switch session: {exc}[/red]")
+                continue
+            save_current_session()
+            active_session = target_session
+            restore_workspace_state(active_session)
+            controller.restore_session(active_session.messages, active_session.plan)
+            session_store.set_active(active_session.session_id)
+            renderer.state_changed(AgentState.READY, plan)
+            console.print(f"[green]Switched to: {active_session.session_id} · {active_session.name}[/green]")
             continue
         if value.startswith("!"):
             command = value[1:].strip()
@@ -304,6 +421,10 @@ async def run_cli(args: argparse.Namespace) -> int:
             console.print(f"[yellow]Unknown command: {value}[/yellow]")
             continue
 
+        if active_session.name_source == DEFAULT_NAME_SOURCE:
+            active_session.name = derive_session_name(value)
+            active_session.name_source = DERIVED_NAME_SOURCE
+
         renderer.start_status(plan)
         try:
             try:
@@ -313,6 +434,7 @@ async def run_cli(args: argparse.Namespace) -> int:
                 renderer.state_changed(AgentState.PAUSED, plan)
                 renderer.warning("Task interrupted; current file changes were preserved.")
         finally:
+            save_current_session()
             renderer.stop_status()
 
     console.print("[dim]Goodbye.[/dim]")

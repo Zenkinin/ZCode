@@ -7,6 +7,7 @@ import pytest
 from zcode.config import Settings
 from zcode.core.controller import AgentController
 from zcode.core.plan import PlanManager
+from zcode.core.session import plan_to_records
 from zcode.core.types import (
     AgentState,
     Message,
@@ -150,3 +151,17 @@ def test_controller_reinjects_current_task_and_plan(tmp_path):
     assert messages[1].role == Role.SYSTEM
     assert "Fix the parser" in messages[1].content
     assert "Inspect" in messages[1].content
+
+
+def test_controller_restores_persisted_messages_and_plan(tmp_path):
+    controller, _ = make_controller(tmp_path, FakeProvider([final_response("unused")]))
+    controller.restore_session(
+        [Message(Role.USER, "Remember this")],
+        [{"id": 1, "description": "Verify", "status": "in_progress"}],
+    )
+
+    messages = controller._model_messages()
+
+    assert any(message.content == "Remember this" for message in messages)
+    assert controller.plan.render_text().startswith("▶ 1. Verify")
+    assert plan_to_records(controller.plan.steps)[0]["status"] == "in_progress"

@@ -69,6 +69,28 @@ class AgentController:
         self._current_task = ""
         self.context.reset(SYSTEM_PROMPT)
 
+    def restore_session(
+        self,
+        messages: list[Message],
+        plan_records: list[dict[str, object]],
+    ) -> None:
+        """Restore persisted state while replacing any old system prompt."""
+        self.context.reset(SYSTEM_PROMPT)
+        for message in messages:
+            if message.role != Role.SYSTEM:
+                self.context.add(message)
+        try:
+            self.plan.restore(plan_records)
+        except ValueError:
+            self.plan.clear()
+
+    def reset_session(self) -> None:
+        self.context.reset(SYSTEM_PROMPT)
+        self.plan.clear()
+        self._recent_fingerprints.clear()
+        self._completion_reminders = 0
+        self._current_task = ""
+
     async def run(self, user_task: str) -> RunOutcome:
         if not user_task.strip():
             return RunOutcome(AgentState.READY, "No task provided.", 0)

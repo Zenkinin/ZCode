@@ -27,6 +27,23 @@ class PlanManager:
     def clear(self) -> None:
         self.steps.clear()
 
+    def restore(self, records: list[dict[str, object]]) -> None:
+        restored: list[PlanStep] = []
+        try:
+            for record in records:
+                restored.append(
+                    PlanStep(
+                        int(record["id"]),
+                        str(record["description"]),
+                        PlanStatus(str(record.get("status", PlanStatus.PENDING.value))),
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid persisted plan: {exc}") from exc
+        if len(restored) > 12:
+            raise ValueError("Persisted plan cannot contain more than 12 steps")
+        self.steps = restored
+
     def create(self, descriptions: list[str]) -> None:
         cleaned = [item.strip() for item in descriptions if item.strip()]
         if not cleaned:
