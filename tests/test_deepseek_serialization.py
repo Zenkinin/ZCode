@@ -6,7 +6,7 @@ import pytest
 
 from zcode.config import Settings
 from zcode.core.types import Message, Role, ToolCall
-from zcode.llm.deepseek import DeepSeekProvider
+from zcode.llm.deepseek import DeepSeekProvider, deepseek_error_message
 
 
 def test_deepseek_assistant_history_preserves_reasoning_and_tools():
@@ -73,3 +73,23 @@ async def test_deepseek_generate_normalizes_response_and_invalid_json(tmp_path):
     assert response.assistant_message.reasoning_content == "provider reasoning"
     assert response.tool_calls[0].parse_error
     assert response.usage.total_tokens == 14
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, "zcode --configure"),
+        (402, "balance"),
+        (404, "ZCODE_MODEL"),
+        (429, "rate limit"),
+        (503, "overloaded"),
+    ],
+)
+def test_deepseek_http_errors_have_actionable_messages(status_code, expected):
+    class StatusError(Exception):
+        pass
+
+    error = StatusError("provider details")
+    error.status_code = status_code
+
+    assert expected in deepseek_error_message(error)

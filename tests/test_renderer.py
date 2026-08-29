@@ -49,3 +49,19 @@ def test_renderer_status_uses_session_working_directory(tmp_path):
     renderer = RichRenderer(workspace, Console(file=StringIO(), force_terminal=False))
 
     assert "cwd: OPPO 互联" in renderer.status_text().plain
+
+
+def test_renderer_animates_only_active_states(tmp_path):
+    renderer = RichRenderer(tmp_path, Console(file=StringIO(), force_terminal=False))
+    plan = PlanManager()
+
+    renderer.state_changed(AgentState.THINKING, plan)
+    first, _ = renderer.status_parts(spinner_frame=0)
+    second, _ = renderer.status_parts(spinner_frame=1)
+    assert first != second
+    assert first.endswith(" thinking")
+
+    renderer.state_changed(AgentState.COMPLETED, plan)
+    completed_first, _ = renderer.status_parts(spinner_frame=0)
+    completed_second, _ = renderer.status_parts(spinner_frame=1)
+    assert completed_first == completed_second == "✓ completed"

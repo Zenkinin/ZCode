@@ -6,6 +6,7 @@ from typing import Any
 
 from openai import (
     APIConnectionError,
+    APIStatusError,
     APITimeoutError,
     AsyncOpenAI,
     InternalServerError,
@@ -14,7 +15,35 @@ from openai import (
 
 from zcode.config import Settings
 from zcode.core.types import Message, ModelResponse, Role, ToolCall, ToolDefinition, Usage
-from zcode.llm.base import LLMProvider
+from zcode.llm.base import LLMProvider, ModelRequestError
+
+
+def deepseek_error_message(exc: BaseException) -> str:
+    """Map DeepSeek/OpenAI-compatible failures to concise recovery guidance."""
+    if isinstance(exc, APITimeoutError):
+        return "DeepSeek timed out. Check your network and retry."
+    if isinstance(exc, APIConnectionError):
+        return (
+            "Cannot connect to DeepSeek. Check your network and "
+            "DEEPSEEK_BASE_URL, then retry."
+        )
+
+    status_code = getattr(exc, "status_code", None)
+    messages = {
+        400: "DeepSeek rejected the request format. Check the selected model and settings.",
+        401: "DeepSeek authentication failed. Run 'zcode --configure' to replace the API key.",
+        402: "DeepSeek account balance is insufficient. Top up the account, then retry.",
+        404: "DeepSeek model was not found. Check ZCODE_MODEL or use the default model.",
+        422: "DeepSeek rejected a request parameter. Check the selected model and settings.",
+        429: "DeepSeek rate limit was reached. Wait briefly, then retry.",
+        500: "DeepSeek has a server error. Wait briefly, then retry.",
+        503: "DeepSeek is overloaded. Wait briefly, then retry.",
+    }
+    if status_code in messages:
+        return messages[status_code]
+    if status_code is not None:
+        return f"DeepSeek request failed with HTTP {status_code}. Retry or check the service status."
+    return f"DeepSeek request failed: {type(exc).__name__}."
 
 
 class DeepSeekProvider(LLMProvider):
@@ -51,10 +80,12 @@ class DeepSeekProvider(LLMProvider):
             try:
                 response = await self.client.chat.completions.create(**request)
                 break
-            except retryable:
+            except retryable as exc:
                 if attempt + 1 >= self.request_retries:
-                    raise
+                    raise ModelRequestError(deepseek_error_message(exc)) from exc
                 await asyncio.sleep(0.5 * (2**attempt))
+            except APIStatusError as exc:
+                raise ModelRequestError(deepseek_error_message(exc)) from exc
         if response is None or not response.choices:
             raise RuntimeError("DeepSeek returned an empty response")
 

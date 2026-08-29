@@ -15,7 +15,7 @@ from zcode.core.types import (
     Role,
     ToolCall,
 )
-from zcode.llm.base import LLMProvider
+from zcode.llm.base import LLMProvider, ModelRequestError
 from zcode.tools.defaults import build_default_registry
 from zcode.workspace import Workspace
 
@@ -27,6 +27,11 @@ class FakeProvider(LLMProvider):
     async def generate(self, messages, tools):
         item = self.responses[0] if len(self.responses) == 1 else self.responses.popleft()
         return item
+
+
+class FailingProvider(LLMProvider):
+    async def generate(self, messages, tools):
+        raise ModelRequestError("DeepSeek authentication failed. Run 'zcode --configure'.")
 
 
 def tool_response(call: ToolCall) -> ModelResponse:
@@ -69,6 +74,17 @@ async def test_controller_executes_tool_then_finishes(tmp_path):
     assert outcome.state == AgentState.COMPLETED
     assert outcome.text == "Done"
     assert (tmp_path / "hello.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_controller_shows_actionable_provider_error(tmp_path):
+    controller, _ = make_controller(tmp_path, FailingProvider())
+
+    outcome = await controller.run("Hello")
+
+    assert outcome.state == AgentState.FAILED
+    assert "zcode --configure" in outcome.text
+    assert "ModelRequestError" not in outcome.text
 
 
 @pytest.mark.asyncio

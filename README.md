@@ -6,7 +6,7 @@ ZCode 是一个运行在本地终端的轻量 Coding Agent。它使用 DeepSeek 
 
 - 读取、搜索、创建和精确编辑工作区文件。
 - 在本地 PowerShell 中运行命令并验证结果。
-- 复杂任务自动建立 Plan，状态栏实时显示 cwd、Git 和进度。
+- 复杂任务自动建立 Plan，动态状态栏实时显示 cwd、Git 和进度。
 - 支持会话目录切换、Diff、Undo、命令补全和无进展保护。
 - API Key 保存到 Windows Credential Manager，不写入项目。
 

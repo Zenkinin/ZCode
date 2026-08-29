@@ -5,6 +5,10 @@ from abc import ABC, abstractmethod
 from zcode.core.types import Message, ModelResponse, ToolDefinition
 
 
+class ModelRequestError(RuntimeError):
+    """A provider failure already translated into safe, actionable user text."""
+
+
 class LLMProvider(ABC):
     @abstractmethod
     async def generate(

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -27,6 +28,15 @@ STATE_STYLE: dict[AgentState, tuple[str, str]] = {
     AgentState.PAUSED: ("⏸", "yellow"),
     AgentState.COMPLETED: ("✓", "green"),
     AgentState.FAILED: ("✕", "red"),
+}
+
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ANIMATED_STATES = {
+    AgentState.THINKING,
+    AgentState.PLANNING,
+    AgentState.EXECUTING,
+    AgentState.RUNNING,
+    AgentState.VERIFYING,
 }
 
 
@@ -54,16 +64,21 @@ class RichRenderer(EventSink):
         self._last_plan = plan
         self._git_label = self._git_status()
         if self._status_live is not None:
-            self._status_live.update(self.status_text(plan), refresh=True)
+            self._status_live.update(self, refresh=True)
 
     @property
     def current_state(self) -> AgentState:
         return self._last_state or AgentState.READY
 
-    def status_parts(self, plan: PlanManager | None = None) -> tuple[str, str]:
+    def status_parts(
+        self,
+        plan: PlanManager | None = None,
+        *,
+        spinner_frame: int | None = None,
+    ) -> tuple[str, str]:
         active_plan = plan or self._last_plan
         state = self.current_state
-        symbol, _ = STATE_STYLE[state]
+        symbol = self._state_symbol(state, spinner_frame)
         progress = "—"
         if active_plan is not None and active_plan.total_count:
             progress = f"{active_plan.completed_count}/{active_plan.total_count}"
@@ -72,21 +87,38 @@ class RichRenderer(EventSink):
         details = f" │ cwd: {cwd} │ git: {self._git_label} │ plan {progress}"
         return primary, details
 
+    @staticmethod
+    def _state_symbol(state: AgentState, spinner_frame: int | None = None) -> str:
+        if state not in ANIMATED_STATES:
+            return STATE_STYLE[state][0]
+        frame = spinner_frame
+        if frame is None:
+            frame = int(time.monotonic() * 10)
+        return SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
+
     def status_text(self, plan: PlanManager | None = None) -> Text:
         state = self.current_state
-        symbol, style = STATE_STYLE[state]
+        _, style = STATE_STYLE[state]
         primary, details = self.status_parts(plan)
         line = Text()
         line.append(primary, style=style)
         line.append(details, style="dim")
         return line
 
+    def __rich_console__(
+        self,
+        console: Console,
+        options: ConsoleOptions,
+    ) -> RenderResult:
+        """Rebuild the status on every Live refresh so its spinner advances."""
+        yield self.status_text()
+
     def start_status(self, plan: PlanManager) -> None:
         if self._status_live is not None:
             return
         self._last_plan = plan
         self._status_live = Live(
-            self.status_text(plan),
+            self,
             console=self.console,
             refresh_per_second=10,
             transient=True,
@@ -130,7 +162,7 @@ class RichRenderer(EventSink):
         else:
             self.console.print("[green]  ✓[/green]")
         if result.metadata.get("cwd_changed") and self._status_live is not None:
-            self._status_live.update(self.status_text(), refresh=True)
+            self._status_live.update(self, refresh=True)
 
     def plan_changed(self, plan: PlanManager) -> None:
         symbols = {

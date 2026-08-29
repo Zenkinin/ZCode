@@ -9,7 +9,7 @@ from zcode.core.context import ContextManager
 from zcode.core.events import EventSink
 from zcode.core.plan import PlanManager, PlanStatus
 from zcode.core.types import AgentState, Message, Role, ToolCall, ToolResult
-from zcode.llm.base import LLMProvider
+from zcode.llm.base import LLMProvider, ModelRequestError
 from zcode.tools.registry import ToolRegistry
 from zcode.workspace import Workspace
 
@@ -107,9 +107,14 @@ class AgentController:
                 response = await self.provider.generate(
                     self._model_messages(), self.tools.definitions()
                 )
+            except ModelRequestError as exc:
+                self._set_state(AgentState.FAILED)
+                text = f"Model request failed: {exc}"
+                self.events.warning(text)
+                return RunOutcome(self.state, text, step)
             except Exception as exc:
                 self._set_state(AgentState.FAILED)
-                text = f"Model request failed: {type(exc).__name__}: {exc}"
+                text = f"Unexpected model error ({type(exc).__name__}): {exc}"
                 self.events.warning(text)
                 return RunOutcome(self.state, text, step)
 
