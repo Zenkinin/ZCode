@@ -244,6 +244,22 @@ Shell 工具不是操作系统沙箱。Agent 发起的 Shell 命令与用户通�
 - `/diff` 只跟踪 ZCode 文件工具在当前任务中记录的修改。
 - 高风险操作前应检查命令、cwd 和实际目标路径。
 
+### 安全授权自测
+
+请只在临时 workspace 中测试。先创建两个测试目录：
+
+```text
+!New-Item safety-a,safety-b -ItemType Directory
+```
+
+1. 要求 Agent 执行 `Remove-Item safety-a -Recurse -Force`，选择 `A`；重新创建并删除 `safety-a` 时应自动使用会话授权。
+2. 再要求删除 `safety-b`，应重新询问，证明授权与目标路径绑定。
+3. 选择 `P` 后退出并在同一 workspace 重启，授权应仍然有效；`/safety` 应显示 `permanent` 记录。
+4. 输入 `/safety revoke `，应可用 Tab 或方向键选择会话和永久授权；撤销后相同操作应重新询问。
+5. 对某条 Agent 命令选择 `N` 后，同一任务再次请求完全相同的命令应被直接拒绝，不重复弹窗；新任务仍可重新确认。
+
+测试结束后可使用 `/safety reset` 清除当前 workspace 的永久授权。
+
 ## 配置变量
 
 | 环境变量 | 默认值 | 说明 |
