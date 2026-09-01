@@ -313,6 +313,12 @@ def submitted_input_text(value: str, width: int) -> Text | None:
     current: list[str] = []
     current_width = 0
     for character in value:
+        if character in "\r\n":
+            if character == "\n":
+                rows.append("".join(current))
+                current = []
+                current_width = 0
+            continue
         character_width = get_cwidth(character)
         if current and current_width + character_width > content_width:
             rows.append("".join(current))
@@ -577,7 +583,11 @@ async def run_cli(args: argparse.Namespace) -> int:
         ),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
-        erase_when_done=False,
+        # A prompt-toolkit prompt is a live terminal surface. Keeping it in
+        # scrollback leaves only its first/top line after the toolbar and
+        # right prompt disappear, especially for pasted multi-line input.
+        # Erase that surface and print a normal Rich render after submission.
+        erase_when_done=True,
         key_bindings=key_bindings,
     )
 
@@ -637,18 +647,17 @@ async def run_cli(args: argparse.Namespace) -> int:
 
     while True:
         try:
-            value = (
-                await session.prompt_async(
-                    input_prompt,
-                    bottom_toolbar=bottom_toolbar,
-                    rprompt=FormattedText([("class:input-border", " │")]),
-                    # PromptSession reserves this height even before completion opens
-                    # because complete_while_typing is enabled. This keeps the input
-                    # cursor fixed near the top of a stable input area instead of
-                    # letting it fall onto the terminal's final row.
-                    reserve_space_for_menu=input_body_rows(console.height),
-                )
-            ).strip()
+            value = await session.prompt_async(
+                input_prompt,
+                bottom_toolbar=bottom_toolbar,
+                rprompt=FormattedText([("class:input-border", " │")]),
+                # PromptSession reserves this height even before completion opens
+                # because complete_while_typing is enabled. This keeps the input
+                # cursor fixed near the top of a stable input area instead of
+                # letting it fall onto the terminal's final row.
+                reserve_space_for_menu=input_body_rows(console.height),
+            )
+            value = value.strip()
         except EOFError:
             break
         except KeyboardInterrupt:
@@ -665,6 +674,10 @@ async def run_cli(args: argparse.Namespace) -> int:
 
         if not value:
             continue
+        # Leave one terminal column unused. Rendering into the last Windows
+        # console column can trigger an implicit wrap and visually detach the
+        # right/bottom border when the window is resized.
+        console.print(submitted_input_text(value, max(24, console.width - 1)))
         if value == "/exit":
             save_current_session()
             break

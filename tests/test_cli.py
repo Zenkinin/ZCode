@@ -210,6 +210,19 @@ def test_submitted_input_wraps_without_losing_text():
     assert content == "中文任务" * 10
 
 
+def test_submitted_input_preserves_explicit_line_breaks_and_alignment():
+    rendered = submitted_input_text("第一行\nsecond line\n第三行", 32)
+
+    assert rendered is not None
+    lines = rendered.plain.splitlines()
+    assert [line[2:-2].rstrip() for line in lines[1:-1]] == [
+        "第一行",
+        "second line",
+        "第三行",
+    ]
+    assert all(get_cwidth(line) == 32 for line in lines)
+
+
 def test_sessions_table_aligns_columns_with_cjk_names():
     summaries = [
         SessionSummary(
