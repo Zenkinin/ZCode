@@ -145,6 +145,39 @@ def input_frame_close(width: int) -> str:
     return "╰" + "─" * (frame_width - 2) + "╯"
 
 
+def submitted_input_text(value: str, width: int) -> Text | None:
+    """Render a completed input box; blank submissions leave no scrollback."""
+    value = value.strip()
+    if not value:
+        return None
+
+    frame_width = max(24, width)
+    content_width = frame_width - 4
+    rows: list[str] = []
+    current: list[str] = []
+    current_width = 0
+    for character in value:
+        character_width = get_cwidth(character)
+        if current and current_width + character_width > content_width:
+            rows.append("".join(current))
+            current = []
+            current_width = 0
+        current.append(character)
+        current_width += character_width
+    rows.append("".join(current))
+
+    rendered = Text()
+    top = input_frame_top(frame_width).splitlines()[0]
+    rendered.append(top + "\n", style="cyan dim")
+    for row in rows:
+        padding = " " * max(0, content_width - get_cwidth(row))
+        rendered.append("│ ", style="cyan dim")
+        rendered.append(row)
+        rendered.append(padding + " │\n", style="cyan dim")
+    rendered.append(input_frame_close(frame_width), style="cyan dim")
+    return rendered
+
+
 def sessions_table(
     summaries: list[SessionSummary],
     active_session_id: str,
@@ -305,6 +338,7 @@ async def run_cli(args: argparse.Namespace) -> int:
         completer=SlashCommandCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
+        erase_when_done=True,
     )
 
     def bottom_toolbar() -> FormattedText:
@@ -336,16 +370,16 @@ async def run_cli(args: argparse.Namespace) -> int:
                     rprompt=FormattedText([("class:input-border", " │")]),
                 )
             ).strip()
-            console.print(input_frame_close(console.width), style="cyan dim")
         except EOFError:
             break
         except KeyboardInterrupt:
-            console.print(input_frame_close(console.width), style="cyan dim")
             console.print("[yellow]Input cancelled.[/yellow]")
             continue
 
-        if not value:
+        submitted = submitted_input_text(value, console.width)
+        if submitted is None:
             continue
+        console.print(submitted)
         if value == "/exit":
             save_current_session()
             break

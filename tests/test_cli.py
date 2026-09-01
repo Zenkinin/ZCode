@@ -13,6 +13,7 @@ from zcode.cli import (
     input_frame_close,
     input_frame_top,
     sessions_table,
+    submitted_input_text,
 )
 from zcode.core.session import SessionSummary
 
@@ -52,6 +53,28 @@ def test_input_frame_has_fixed_width_and_truncates_long_status():
     assert "…" in status
     assert get_cwidth(prefix + status + suffix) == width
     assert get_cwidth(input_frame_close(width)) == width
+
+
+def test_submitted_input_ignores_blank_and_renders_complete_box():
+    assert submitted_input_text("   ", 48) is None
+
+    rendered = submitted_input_text("/sessions", 48)
+
+    assert rendered is not None
+    lines = rendered.plain.splitlines()
+    assert len(lines) == 3
+    assert "/sessions" in lines[1]
+    assert all(get_cwidth(line) == 48 for line in lines)
+
+
+def test_submitted_input_wraps_without_losing_text():
+    rendered = submitted_input_text("中文任务" * 10, 24)
+
+    assert rendered is not None
+    content = "".join(
+        line[2:-2].rstrip() for line in rendered.plain.splitlines()[1:-1]
+    )
+    assert content == "中文任务" * 10
 
 
 def test_sessions_table_aligns_columns_with_cjk_names():
