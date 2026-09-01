@@ -104,7 +104,7 @@ zcode
 | `/error [id]` | 展开最近或指定错误的完整内容 |
 | `/errors` | 列出当前会话的错误记录 |
 | `/safety` | 查看当前进程和当前 workspace 的 Shell 授权 |
-| `/safety revoke <risk>` | 撤销指定永久授权 |
+| `/safety revoke <id>` | 撤销指定会话或永久授权，支持补全选择 |
 | `/safety reset` | 清除当前 workspace 的全部永久授权 |
 | `!<command>` | 不经过模型，直接运行 PowerShell |
 | `/exit` | 保存当前会话并退出 |
@@ -229,11 +229,13 @@ Shell 工具不是操作系统沙箱。Agent 发起的 Shell 命令与用户通�
 ```
 
 - `Y`：只允许当前命令。
-- `A`：本次 ZCode 进程内允许同类风险，退出后清除。
-- `P`：永久允许当前 workspace 内的同类风险。
+- `A`：本次 ZCode 进程内允许相同风险与目标范围，退出后清除。
+- `P`：永久允许当前 workspace 内相同风险与目标范围。
 - `N` 或 Esc：拒绝当前命令，Agent 可以根据拒绝结果调整方案。
 
-永久授权按“规范化 workspace 路径 + 风险类型”保存到用户级 ZCode 配置，不会写入项目。涉及 `.git`、`.zcode`、`.venv`、workspace 根目录或显式 workspace 完整路径的命令仍会重新确认。使用 `/safety` 可同时查看会话级和永久授权；`/safety revoke <risk>` 与 `/safety reset` 只撤销永久授权。
+授权范围会绑定解析后的删除目标路径；删除 `build` 的许可不会放行删除 `src`。Git 风险绑定当前仓库目录。无法可靠解析目标、包含通配符、指向 workspace 外部或涉及 `.git`、`.zcode`、`.venv`、workspace 根目录时，不提供永久授权。永久授权保存在用户级 ZCode 配置，不会写入项目。使用 `/safety` 可查看带 ID 的授权表，输入 `/safety revoke ` 可补全选择并撤销会话或永久授权，`/safety reset` 清除当前 workspace 的全部永久授权。
+
+如果永久授权写入失败，ZCode 会明确提示并仅放行当前命令。用户拒绝某条 Agent 命令后，同一任务再次请求完全相同的命令会被直接拒绝，不再重复弹窗。
 
 仍需注意：
 

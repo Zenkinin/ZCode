@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 from uuid import uuid4
@@ -44,8 +45,8 @@ from zcode.core.session import (
 from zcode.core.types import AgentState, ToolCall
 from zcode.llm.deepseek import DeepSeekProvider
 from zcode.tools.defaults import build_default_registry
-from zcode.tools.shell import classify_command, has_sensitive_target
-from zcode.security import SecurityPolicy
+from zcode.security import Approval, SecurityPolicy, SecurityPolicyError
+from zcode.tools.shell import classify_command, command_approval_scope
 from zcode.ui.renderer import RichRenderer
 from zcode.workspace import Workspace
 
@@ -161,12 +162,14 @@ class SlashCommandCompleter(Completer):
         session_provider=None,
         active_session_provider=None,
         model_provider=None,
+        safety_provider=None,
     ) -> None:
         self.session_provider = session_provider or (lambda: [])
         self.active_session_provider = active_session_provider or (lambda: "")
         self.model_provider = model_provider or (
             lambda: ("deepseek-v4-flash", "enabled", "high")
         )
+        self.safety_provider = safety_provider or (lambda: [])
 
     def get_completions(self, document: Document, complete_event):
         value = document.text_before_cursor
@@ -229,6 +232,38 @@ class SlashCommandCompleter(Completer):
                     option,
                     start_position=-len(remainder),
                     display=f"{marker}{option.strip()}",
+                    display_meta=description,
+                )
+            return
+        if value.startswith("/safety revoke "):
+            query = value[15:].strip().lower()
+            for approval in self.safety_provider():
+                searchable = (
+                    f"{approval.approval_id} {approval.risk} {approval.scope}"
+                ).lower()
+                if query and query not in searchable:
+                    continue
+                yield Completion(
+                    approval.approval_id,
+                    start_position=-len(value[15:]),
+                    display=approval.approval_id,
+                    display_meta=_truncate_display(
+                        f"{approval.risk} · {approval.scope}", 50
+                    ),
+                )
+            return
+        if value.startswith("/safety "):
+            query = value[8:].strip().lower()
+            for option, description in (
+                ("revoke ", "Select an approval to revoke"),
+                ("reset", "Clear permanent approvals for this workspace"),
+            ):
+                if query and not option.startswith(query):
+                    continue
+                yield Completion(
+                    option,
+                    start_position=-len(value[8:]),
+                    display=option.strip(),
                     display_meta=description,
                 )
             return
@@ -389,6 +424,22 @@ def session_choices(
     return choices
 
 
+def safety_table(
+    session_approvals: list[Approval],
+    permanent_approvals: list[Approval],
+) -> Table:
+    table = Table(box=None, show_edge=False, pad_edge=False, padding=(0, 2))
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("LIFETIME", no_wrap=True)
+    table.add_column("RISK", max_width=36, overflow="ellipsis", no_wrap=True)
+    table.add_column("SCOPE", max_width=48, overflow="ellipsis", no_wrap=True)
+    for approval in session_approvals:
+        table.add_row(approval.approval_id, "session", approval.risk, approval.scope)
+    for approval in permanent_approvals:
+        table.add_row(approval.approval_id, "permanent", approval.risk, approval.scope)
+    return table
+
+
 def persistent_cd_target(command: str) -> str | None:
     """Return a path for a simple cd command; reject compound shell syntax."""
     stripped = command.strip()
@@ -477,34 +528,56 @@ async def run_cli(args: argparse.Namespace) -> int:
 
     restore_workspace_state(active_session)
     provider = DeepSeekProvider(settings)
-    always_allowed_risks: set[str] = set()
     security = SecurityPolicy(workspace.root)
+    if security.load_warning:
+        console.print(f"[yellow]{security.load_warning}[/yellow]")
+    session_approvals: dict[tuple[str, str], Approval] = {}
+    denied_commands: set[str] = set()
 
-    def sensitive_target(command: str) -> bool:
-        return has_sensitive_target(command, str(workspace.root))
+    def approval_scopes(command: str, cwd: str) -> tuple[str, str]:
+        permanent = command_approval_scope(command, cwd, str(workspace.root))
+        if permanent is not None:
+            return permanent, permanent
+        normalized = " ".join(command.split()).casefold()
+        digest = hashlib.sha256(f"{cwd.casefold()}\0{normalized}".encode()).hexdigest()[:8]
+        return f"exact-command:{digest}", ""
 
-    def print_risk_prompt(command: str, risk, cwd: str) -> None:
+    def print_risk_prompt(command: str, risk, cwd: str, permanent: bool) -> None:
+        permanent_option = (
+            "[bold magenta]\\[P][/bold magenta] permanent   "
+            if permanent
+            else "[dim]\\[P] unavailable   [/dim]"
+        )
         console.print(
             f"[bold yellow]⚠ Risk:[/bold yellow] {risk.reason}\n"
             f"[dim]cwd:[/dim] {cwd}\n"
             f"[dim]command:[/dim] {command}\n"
             "[bold green]\\[Y][/bold green] once   "
             "[bold cyan]\\[A][/bold cyan] session   "
-            "[bold magenta]\\[P][/bold magenta] permanent   "
+            f"{permanent_option}"
             "[bold red]\\[N][/bold red] no"
         )
 
     async def confirm_agent_command(command: str, risk, cwd: str) -> str:
         """Ask before an Agent-issued destructive shell command."""
-        if risk.reason in always_allowed_risks:
+        session_scope, permanent_scope = approval_scopes(command, cwd)
+        key = (risk.reason, session_scope)
+        fingerprint = hashlib.sha256(
+            f"{cwd.casefold()}\0{' '.join(command.split()).casefold()}".encode()
+        ).hexdigest()
+        if controller.current_task and fingerprint in denied_commands:
             console.print(
-                f"[dim]✓ Risk auto-approved (\\[A] always): {risk.reason}[/dim]"
+                "[yellow]Command denied: the user already rejected this exact "
+                "command during the current task.[/yellow]"
             )
+            return "no"
+        if key in session_approvals:
+            console.print(f"[dim]Risk approved for this session: {session_scope}[/dim]")
             return "always"
-        if security.allows(risk.reason) and not sensitive_target(command):
-            console.print(f"[dim]Risk permanently approved: {risk.reason}[/dim]")
+        if security.allows(risk.reason, permanent_scope or None):
+            console.print(f"[dim]Risk permanently approved: {permanent_scope}[/dim]")
             return "always"
-        print_risk_prompt(command, risk, cwd)
+        print_risk_prompt(command, risk, cwd, bool(permanent_scope))
         was_status_active = renderer.status_active
         renderer.stop_status()
         try:
@@ -517,13 +590,30 @@ async def run_cli(args: argparse.Namespace) -> int:
             if was_status_active:
                 renderer.start_status(plan)
         if answer in {"p", "permanent"}:
-            security.grant(risk.reason)
+            if not permanent_scope:
+                console.print(
+                    "[yellow]Permanent approval is unavailable because the target "
+                    "could not be scoped safely. Command denied.[/yellow]"
+                )
+                return "no"
+            try:
+                security.grant(risk.reason, permanent_scope)
+            except SecurityPolicyError as exc:
+                console.print(
+                    f"[yellow]{exc} Allowed once for this command only.[/yellow]"
+                )
+                return "once"
             return "always"
         if answer in {"a", "always"}:
-            always_allowed_risks.add(risk.reason)
+            approval_id = "s-" + hashlib.sha256(
+                f"{risk.reason}\0{session_scope}".encode()
+            ).hexdigest()[:8]
+            session_approvals[key] = Approval(approval_id, risk.reason, session_scope)
             return "always"
         if answer in {"y", "yes", "once"}:
             return "once"
+        if controller.current_task:
+            denied_commands.add(fingerprint)
         return "no"
 
     tools = build_default_registry(
@@ -650,6 +740,10 @@ async def run_cli(args: argparse.Namespace) -> int:
                 provider.settings.thinking,
                 provider.settings.reasoning_effort,
             ),
+            safety_provider=lambda: [
+                *session_approvals.values(),
+                *security.approvals(),
+            ],
         ),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
@@ -772,28 +866,51 @@ async def run_cli(args: argparse.Namespace) -> int:
         if value == "/safety" or value.startswith("/safety "):
             argument = value[7:].strip()
             if argument in {"reset", "clear"}:
-                security.revoke()
-                console.print("[green]Permanent shell approvals cleared.[/green]")
+                try:
+                    security.revoke()
+                    console.print("[green]Permanent shell approvals cleared.[/green]")
+                except SecurityPolicyError as exc:
+                    console.print(f"[red]{exc}[/red]")
             elif argument.startswith("revoke "):
-                risk_name = argument[7:].strip()
-                security.revoke(risk_name)
-                console.print(f"[green]Revoked permanent approval: {risk_name}[/green]")
+                approval_id = argument[7:].strip()
+                session_key = next(
+                    (
+                        key
+                        for key, approval in session_approvals.items()
+                        if approval.approval_id == approval_id
+                    ),
+                    None,
+                )
+                if session_key is not None:
+                    session_approvals.pop(session_key)
+                    console.print(
+                        f"[green]Revoked session approval: {approval_id}[/green]"
+                    )
+                    continue
+                try:
+                    removed = security.revoke(approval_id)
+                except SecurityPolicyError as exc:
+                    console.print(f"[red]{exc}[/red]")
+                    continue
+                if removed:
+                    console.print(
+                        f"[green]Revoked permanent approval: {approval_id}[/green]"
+                    )
+                else:
+                    console.print(f"[yellow]Approval not found: {approval_id}[/yellow]")
             else:
                 console.print(f"workspace: {workspace.root}")
-                session_risks = sorted(always_allowed_risks)
-                permanent_risks = security.risks()
-                console.print("Session approvals (cleared when ZCode exits):")
-                console.print(
-                    "\n".join(f"- {risk}" for risk in session_risks)
-                    if session_risks else "(none)"
+                session_items = sorted(
+                    session_approvals.values(), key=lambda item: (item.risk, item.scope)
                 )
-                console.print("Permanent approvals (this workspace):")
+                permanent_items = security.approvals()
+                if session_items or permanent_items:
+                    console.print(safety_table(session_items, permanent_items))
+                else:
+                    console.print("[dim]No shell approvals.[/dim]")
                 console.print(
-                    "\n".join(f"- {risk}" for risk in permanent_risks)
-                    if permanent_risks else "(none)"
-                )
-                console.print(
-                    "Use /safety revoke <risk> or /safety reset to clear permanent approvals."
+                    "[dim]Session approvals expire on exit. Use /safety revoke <id> "
+                    "or /safety reset for permanent approvals.[/dim]"
                 )
             continue
         if value == "/model" or value.startswith("/model "):
@@ -988,6 +1105,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             active_session.name_source = DERIVED_NAME_SOURCE
             renderer.set_session(active_session.name, active_session.session_id)
 
+        denied_commands.clear()
         await run_agent(controller.run(value))
 
     console.print("[dim]Goodbye.[/dim]")

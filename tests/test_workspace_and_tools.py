@@ -9,7 +9,12 @@ from zcode.tools.filesystem import (
     SearchTextTool,
     WriteFileTool,
 )
-from zcode.tools.shell import RunCommandTool, classify_command, has_sensitive_target
+from zcode.tools.shell import (
+    RunCommandTool,
+    classify_command,
+    command_approval_scope,
+    has_sensitive_target,
+)
 from zcode.tools.navigation import ChangeDirectoryTool
 from zcode.workspace import Workspace, WorkspaceViolation
 
@@ -168,6 +173,25 @@ def test_sensitive_shell_targets_always_require_per_command_confirmation(tmp_pat
     ):
         assert has_sensitive_target(command, root)
     assert not has_sensitive_target("Remove-Item build -Recurse -Force", root)
+
+
+def test_shell_approval_scope_is_bound_to_target_path(tmp_path):
+    root = str(tmp_path)
+    assert command_approval_scope(
+        "Remove-Item build -Recurse -Force", root, root
+    ) == "path:build"
+    assert command_approval_scope(
+        "Remove-Item src -Recurse -Force", root, root
+    ) == "path:src"
+    assert command_approval_scope("git clean -fd", root, root) == "git:."
+    assert command_approval_scope("Remove-Item . -Recurse -Force", root, root) is None
+    assert command_approval_scope(
+        "Remove-Item ../outside -Recurse -Force", root, root
+    ) is None
+    assert command_approval_scope(
+        "Remove-Item $env:TEMP -Recurse -Force", root, root
+    ) is None
+    assert command_approval_scope("git clean -fd", str(tmp_path.parent), root) is None
 
 
 @pytest.mark.asyncio

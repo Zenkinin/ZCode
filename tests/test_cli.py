@@ -22,6 +22,7 @@ from zcode.cli import (
     submitted_input_text,
 )
 from zcode.core.session import SessionSummary
+from zcode.security import Approval
 
 
 def completions_for(value: str, completer=None):
@@ -144,6 +145,25 @@ def test_switch_completer_limits_visible_candidates():
     completer = SlashCommandCompleter(session_provider=lambda: summaries)
 
     assert len(completions_for("/switch ", completer)) == 8
+
+
+def test_safety_revoke_completer_lists_and_filters_permanent_approvals():
+    approvals = [
+        Approval("p-11111111", "recursive deletion", "path:build"),
+        Approval("p-22222222", "forced Git clean", "git:."),
+    ]
+    completer = SlashCommandCompleter(safety_provider=lambda: approvals)
+
+    assert [
+        item.text for item in completions_for("/safety revoke ", completer)
+    ] == ["p-11111111", "p-22222222"]
+    assert [
+        item.text for item in completions_for("/safety revoke build", completer)
+    ] == ["p-11111111"]
+    assert [item.text for item in completions_for("/safety ", completer)] == [
+        "revoke ",
+        "reset",
+    ]
 
 
 def test_input_body_reserves_stable_space_and_scales_for_short_terminals():

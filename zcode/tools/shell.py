@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import re
+import shlex
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -58,6 +59,69 @@ def has_sensitive_target(command: str, workspace_root: str) -> bool:
             command,
         )
     )
+
+
+def command_approval_scope(
+    command: str,
+    cwd: str,
+    workspace_root: str,
+) -> str | None:
+    """Return a stable workspace-relative scope when the target is unambiguous."""
+    root = os.path.normcase(os.path.abspath(workspace_root))
+    working_directory = os.path.normcase(os.path.abspath(cwd))
+    if re.search(r"(?i)\bgit\s+", command):
+        try:
+            if os.path.commonpath((root, working_directory)) != root:
+                return None
+            relative = os.path.relpath(working_directory, root)
+        except ValueError:
+            return None
+        return f"git:{relative}"
+
+    match = re.search(r"(?i)\b(remove-item|rm|rmdir|rd|del)\b([^;&|\r\n]*)", command)
+    if not match:
+        return None
+    try:
+        tokens = shlex.split(match.group(2), posix=False)
+    except ValueError:
+        return None
+    candidates: list[str] = []
+    expects_path = False
+    for raw in tokens:
+        token = raw.strip("'\"").rstrip(",")
+        if not token:
+            continue
+        if token.casefold() in {"-path", "-literalpath"}:
+            expects_path = True
+            continue
+        if token.startswith("-") or token.casefold() in {"/s", "/q", "/f"}:
+            continue
+        if expects_path or not candidates:
+            candidates.append(token)
+            expects_path = False
+        else:
+            # Multiple positional targets cannot be represented by one grant.
+            return None
+    if len(candidates) != 1 or any(
+        char in candidates[0] for char in "*?[],$%`(){}"
+    ):
+        return None
+    target = os.path.normcase(
+        os.path.abspath(os.path.join(working_directory, candidates[0]))
+    )
+    try:
+        if os.path.commonpath((root, target)) != root:
+            return None
+        relative = os.path.relpath(target, root)
+    except ValueError:
+        return None
+    if relative == "." or relative.split(os.sep)[0].casefold() in {
+        ".git",
+        ".zcode",
+        ".venv",
+    }:
+        return None
+    return f"path:{relative}"
 
 
 def _trim_output(value: str, limit: int) -> str:
@@ -118,7 +182,7 @@ class RunCommandTool(Tool):
             if decision not in {"once", "always"}:
                 return ToolResult(
                     False,
-                    "Destructive command denied pending explicit user confirmation. "
+                    "Destructive command was not approved by the user. "
                     f"Reason: {risk.reason}. Command: {command}",
                     error_code="confirmation_required",
                     metadata={"risk": risk.level, "risk_reason": risk.reason, "decision": "no"},
