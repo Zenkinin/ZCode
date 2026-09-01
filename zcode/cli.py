@@ -57,8 +57,6 @@ HELP = """[bold]Commands[/bold]
 /switch [id]  Select or switch to a session
 /session  Show the current session
 /rename <name>  Rename the current session
-/cwd  Show workspace, cwd, and Git root
-/cd <path>  Change the persistent session directory
 /error [id]  Show full output for an error
 /errors  List errors in the current session
 !cmd   Run a shell command directly (PowerShell on Windows)
@@ -75,8 +73,6 @@ SLASH_COMMANDS = {
     "/switch": "Select or switch to a session",
     "/session": "Show current session",
     "/rename": "Rename the current session",
-    "/cwd": "Show current directories",
-    "/cd": "Change persistent session directory",
     "/error": "Show full error output",
     "/errors": "List session errors",
     "/exit": "Exit ZCode",
@@ -89,6 +85,11 @@ PREFERRED_INPUT_BODY_ROWS = 8
 def input_body_rows(terminal_height: int) -> int:
     """Keep the prompt above the terminal edge without overwhelming short terminals."""
     return min(PREFERRED_INPUT_BODY_ROWS, max(4, terminal_height // 4))
+
+
+def clear_input_buffer(event) -> None:
+    """Clear the current prompt without submitting it."""
+    event.current_buffer.reset()
 
 
 class SlashCommandCompleter(Completer):
@@ -419,6 +420,10 @@ async def run_cli(args: argparse.Namespace) -> int:
         if event.current_buffer.text.strip():
             event.current_buffer.validate_and_handle()
 
+    @key_bindings.add("escape", "escape")
+    def clear_input(event) -> None:
+        clear_input_buffer(event)
+
     session: PromptSession[str] = PromptSession(
         history=FileHistory(str(history_dir / "history")),
         style=prompt_style,
@@ -498,28 +503,6 @@ async def run_cli(args: argparse.Namespace) -> int:
                 f"Session {active_session.session_id} · {active_session.name} · "
                 f"cwd: {workspace.cwd_relative}"
             )
-            continue
-        if value == "/cwd":
-            git_root = workspace.root
-            console.print(
-                f"workspace: {workspace.root}\n"
-                f"cwd:       {workspace.cwd_relative}\n"
-                f"git root:  {git_root}"
-            )
-            continue
-        if value == "/cd" or value.startswith("/cd "):
-            target = value[3:].strip()
-            if not target:
-                console.print("[yellow]Usage: /cd <path>[/yellow]")
-                continue
-            try:
-                workspace.change_directory(target)
-            except (OSError, ValueError) as exc:
-                console.print(f"[red]Could not change directory: {exc}[/red]")
-                continue
-            save_current_session()
-            renderer.state_changed(AgentState.READY, plan)
-            console.print(f"[green]cwd: {workspace.cwd_relative}[/green]")
             continue
         if value == "/error" or value.startswith("/error "):
             error_id = value[6:].strip() or None
@@ -610,7 +593,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             if re.match(r"(?i)^\s*(?:cd|set-location)\b", command):
                 console.print(
                     "[yellow]Compound cd commands do not persist. "
-                    "Use /cd <path>, then run the command separately.[/yellow]"
+                    "Use !cd <path>, then run the command separately.[/yellow]"
                 )
                 continue
             arguments = {"command": command}

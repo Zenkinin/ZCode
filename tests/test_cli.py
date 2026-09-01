@@ -9,6 +9,7 @@ from rich.console import Console
 
 from zcode.cli import (
     SlashCommandCompleter,
+    clear_input_buffer,
     input_frame_bottom,
     input_frame_close,
     input_body_rows,
@@ -34,7 +35,8 @@ def test_slash_completer_lists_commands_and_filters_prefix():
     help_matches = [item.text for item in completions_for("/he")]
 
     assert {"/help", "/plan", "/diff", "/undo", "/exit"} <= all_commands
-    assert {"/switch", "/cd", "/cwd", "/error", "/errors"} <= all_commands
+    assert {"/switch", "/error", "/errors"} <= all_commands
+    assert {"/cd", "/cwd"}.isdisjoint(all_commands)
     assert help_matches == ["/help"]
 
 
@@ -80,6 +82,26 @@ def test_input_body_reserves_stable_space_and_scales_for_short_terminals():
     assert input_body_rows(40) == 8
     assert input_body_rows(24) == 6
     assert input_body_rows(12) == 4
+
+
+def test_double_escape_handler_clears_without_submitting():
+    class FakeBuffer:
+        def __init__(self):
+            self.text = "unfinished command"
+            self.reset_calls = 0
+
+        def reset(self):
+            self.text = ""
+            self.reset_calls += 1
+
+    class FakeEvent:
+        current_buffer = FakeBuffer()
+
+    event = FakeEvent()
+    clear_input_buffer(event)
+
+    assert event.current_buffer.text == ""
+    assert event.current_buffer.reset_calls == 1
 
 
 def test_input_frame_has_fixed_width_and_truncates_long_status():
