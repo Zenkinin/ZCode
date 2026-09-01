@@ -147,6 +147,9 @@ class RunCommandTool(Tool):
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(), timeout=timeout
             )
+        except asyncio.CancelledError:
+            await self._terminate_process_tree(process)
+            raise
         except TimeoutError:
             await self._terminate_process_tree(process)
             return ToolResult(

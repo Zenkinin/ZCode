@@ -157,6 +157,44 @@ async def test_controller_reminds_once_before_leaving_plan_incomplete(tmp_path):
     assert outcome.text == "Need input"
 
 
+@pytest.mark.asyncio
+async def test_controller_continues_paused_task_with_corrections_and_plan(tmp_path):
+    controller, _ = make_controller(tmp_path, FakeProvider([final_response("Corrected")]))
+    controller._current_task = "Implement search"
+    controller.plan.create(["Inspect", "Implement"])
+    controller.pause()
+    controller.add_correction("Do not add a description field")
+
+    outcome = await controller.resume()
+
+    assert outcome.state == AgentState.WAITING
+    assert any(
+        message.content and "Do not add a description field" in message.content
+        for message in controller.context.messages
+    )
+    assert controller.plan.total_count == 2
+
+
+def test_controller_abandons_paused_task_but_preserves_context(tmp_path):
+    controller, _ = make_controller(tmp_path, FakeProvider([final_response("unused")]))
+    controller._current_task = "Old task"
+    controller.plan.create(["Old plan"])
+    controller.pause()
+    controller.add_correction("Correction")
+
+    controller.abandon_paused()
+
+    assert controller.state == AgentState.READY
+    assert not controller.is_paused
+    assert controller.current_task == ""
+    assert controller.corrections == []
+    assert controller.plan.total_count == 0
+    assert any(
+        message.content == "The paused task was abandoned by the user."
+        for message in controller.context.messages
+    )
+
+
 def test_controller_reinjects_current_task_and_plan(tmp_path):
     controller, _ = make_controller(tmp_path, FakeProvider([final_response("unused")]))
     controller._current_task = "Fix the parser"

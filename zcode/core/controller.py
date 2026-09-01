@@ -67,12 +67,16 @@ class AgentController:
         self._recent_fingerprints: list[str] = []
         self._completion_reminders = 0
         self._current_task = ""
+        self._corrections: list[str] = []
         self.context.reset(SYSTEM_PROMPT)
 
     def restore_session(
         self,
         messages: list[Message],
         plan_records: list[dict[str, object]],
+        *,
+        paused_task: str = "",
+        corrections: list[str] | None = None,
     ) -> None:
         """Restore persisted state while replacing any old system prompt."""
         self.context.reset(SYSTEM_PROMPT)
@@ -83,6 +87,9 @@ class AgentController:
             self.plan.restore(plan_records)
         except ValueError:
             self.plan.clear()
+        self._current_task = paused_task
+        self._corrections = list(corrections or [])
+        self.state = AgentState.PAUSED if paused_task else AgentState.READY
 
     def reset_session(self) -> None:
         self.context.reset(SYSTEM_PROMPT)
@@ -90,6 +97,45 @@ class AgentController:
         self._recent_fingerprints.clear()
         self._completion_reminders = 0
         self._current_task = ""
+        self._corrections.clear()
+
+    @property
+    def current_task(self) -> str:
+        return self._current_task
+
+    @property
+    def corrections(self) -> list[str]:
+        return list(self._corrections)
+
+    @property
+    def is_paused(self) -> bool:
+        return self.state == AgentState.PAUSED and bool(self._current_task)
+
+    def pause(self) -> None:
+        if self._current_task:
+            self._set_state(AgentState.PAUSED)
+
+    def add_correction(self, text: str) -> None:
+        correction = text.strip()
+        if not self.is_paused or not correction:
+            raise ValueError("There is no paused task to correct")
+        self._corrections.append(correction)
+        self.context.add(
+            Message(Role.USER, f"Correction for the paused task: {correction}")
+        )
+
+    def abandon_paused(self) -> None:
+        if not self.is_paused:
+            return
+        self.context.add(
+            Message(Role.SYSTEM, "The paused task was abandoned by the user.")
+        )
+        self.plan.clear()
+        self._current_task = ""
+        self._corrections.clear()
+        self._recent_fingerprints.clear()
+        self._completion_reminders = 0
+        self._set_state(AgentState.READY)
 
     async def run(self, user_task: str) -> RunOutcome:
         if not user_task.strip():
@@ -99,7 +145,24 @@ class AgentController:
         self._recent_fingerprints.clear()
         self._completion_reminders = 0
         self._current_task = user_task.strip()
+        self._corrections.clear()
         self.context.add(Message(Role.USER, self._current_task))
+
+        return await self._run_loop()
+
+    async def resume(self) -> RunOutcome:
+        if not self.is_paused:
+            return RunOutcome(AgentState.READY, "No paused task to resume.", 0)
+        self._recent_fingerprints.clear()
+        self._completion_reminders = 0
+        instruction = (
+            "Continue the paused task using the current plan and completed work. Apply all user "
+            "corrections, and update or revisit plan steps when the corrections require it."
+        )
+        self.context.add(Message(Role.SYSTEM, instruction))
+        return await self._run_loop()
+
+    async def _run_loop(self) -> RunOutcome:
 
         for step in range(1, self.settings.emergency_max_steps + 1):
             self._set_state(AgentState.THINKING)
@@ -143,12 +206,26 @@ class AgentController:
                     return RunOutcome(self.state, final_text, step)
                 self.events.assistant_text(final_text)
                 self._set_state(AgentState.COMPLETED)
+                self._current_task = ""
+                self._corrections.clear()
                 return RunOutcome(self.state, final_text, step)
 
             for call in response.tool_calls:
                 self._set_state(self._state_for_call(call))
                 self.events.tool_started(call)
-                result = await self.tools.execute(call)
+                try:
+                    result = await self.tools.execute(call)
+                except asyncio.CancelledError:
+                    result = ToolResult(
+                        False,
+                        "Tool execution was cancelled because the user paused the task.",
+                        error_code="user_paused",
+                    )
+                    self.events.tool_finished(call, result)
+                    self.context.add(
+                        Message(Role.TOOL, result.content, tool_call_id=call.id)
+                    )
+                    raise
                 self.events.tool_finished(call, result)
                 self.context.add(
                     Message(Role.TOOL, result.content, tool_call_id=call.id)
@@ -216,6 +293,11 @@ class AgentController:
     def _model_messages(self) -> list[Message]:
         messages = self.context.build()
         runtime_lines = [f"Current user task:\n{self._current_task}"]
+        if self._corrections:
+            runtime_lines.append(
+                "User corrections supplied while paused:\n- "
+                + "\n- ".join(self._corrections)
+            )
         runtime_lines.append(
             "Current session working directory (workspace-relative):\n"
             f"{self.workspace.cwd_relative}"

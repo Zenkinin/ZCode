@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import Any
 
 from openai import (
@@ -59,6 +60,29 @@ class DeepSeekProvider(LLMProvider):
             max_retries=0,
             timeout=60.0,
         )
+
+    def configure(
+        self,
+        *,
+        model: str | None = None,
+        thinking: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        updates: dict[str, str] = {}
+        if model is not None:
+            cleaned_model = model.strip()
+            if not cleaned_model or any(character.isspace() for character in cleaned_model):
+                raise ValueError("Model name must be one non-empty value")
+            updates["model"] = cleaned_model
+        if thinking is not None:
+            if thinking not in {"enabled", "disabled"}:
+                raise ValueError("Thinking must be enabled or disabled")
+            updates["thinking"] = thinking
+        if reasoning_effort is not None:
+            if reasoning_effort not in {"low", "high", "max"}:
+                raise ValueError("Reasoning effort must be low, high, or max")
+            updates["reasoning_effort"] = reasoning_effort
+        self.settings = replace(self.settings, **updates)
 
     async def generate(
         self,

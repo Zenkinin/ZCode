@@ -13,7 +13,10 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.shortcuts import yes_no_dialog
 from prompt_toolkit.styles import Style
@@ -47,32 +50,36 @@ from zcode.ui.renderer import RichRenderer
 from zcode.workspace import Workspace
 
 
-HELP = """[bold]Commands[/bold]
-/help  Show this help
-/plan  Show the current plan
-/diff  Show changes made by the current task
-/undo  Restore files changed by the current task
-/new [name]  Create a new conversation session
-/sessions  List sessions in this workspace
-/switch [id]  Select or switch to a session
-/session  Show the current session
-/rename <name>  Rename the current session
-/error [id]  Show full output for an error
-/errors  List errors in the current session
-!cmd   Run a shell command directly (PowerShell on Windows)
-/exit  Exit ZCode
-"""
+HELP_COMMANDS = (
+    ("/help", "Show this help"),
+    ("/plan", "Show the current plan"),
+    ("/diff", "Show current-task changes"),
+    ("/model", "Show model and thinking settings"),
+    ("/model <name>", "Switch model for later requests"),
+    ("/model thinking <off|low|high|max>", "Set DeepSeek thinking mode"),
+    ("/new [name]", "Create a new conversation session"),
+    ("/sessions", "List sessions in this workspace"),
+    ("/switch [id]", "Select or switch to a session"),
+    ("/rename <name>", "Rename the current session"),
+    ("/clear", "Clear terminal output"),
+    ("/continue", "Continue a paused task with corrections"),
+    ("/error [id]", "Show full output for an error"),
+    ("/errors", "List errors in the current session"),
+    ("!cmd", "Run PowerShell directly without the model"),
+    ("/exit", "Exit ZCode"),
+)
 
 SLASH_COMMANDS = {
     "/help": "Show command help",
     "/plan": "Show the current plan",
     "/diff": "Show current-task changes",
-    "/undo": "Restore current-task changes",
+    "/model": "Switch model or thinking mode",
     "/new": "Create a new conversation session",
     "/sessions": "List workspace sessions",
     "/switch": "Select or switch to a session",
-    "/session": "Show current session",
     "/rename": "Rename the current session",
+    "/clear": "Clear terminal output",
+    "/continue": "Continue paused task",
     "/error": "Show full error output",
     "/errors": "List session errors",
     "/exit": "Exit ZCode",
@@ -80,6 +87,12 @@ SLASH_COMMANDS = {
 
 MAX_VISIBLE_COMPLETIONS = 8
 PREFERRED_INPUT_BODY_ROWS = 8
+KNOWN_DEEPSEEK_MODELS = (
+    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
+)
+THINKING_LEVELS = ("off", "low", "high", "max")
 
 
 def input_body_rows(terminal_height: int) -> int:
@@ -87,15 +100,71 @@ def input_body_rows(terminal_height: int) -> int:
     return min(PREFERRED_INPUT_BODY_ROWS, max(4, terminal_height // 4))
 
 
+def help_table() -> Table:
+    table = Table(
+        box=None,
+        show_edge=False,
+        pad_edge=False,
+        padding=(0, 2),
+    )
+    table.add_column("COMMAND", width=40, no_wrap=True, style="magenta")
+    table.add_column("DESCRIPTION", width=46, no_wrap=True)
+    for command, description in HELP_COMMANDS:
+        table.add_row(command, description)
+    return table
+
+
+def parse_model_command(value: str) -> tuple[str, str | None]:
+    arguments = value[len("/model") :].strip()
+    if not arguments:
+        return "show", None
+    if arguments.lower() == "thinking":
+        raise ValueError("Usage: /model thinking <off|low|high|max>")
+    if arguments.lower().startswith("thinking "):
+        level = arguments[9:].strip().lower()
+        if level not in {"off", "low", "high", "max"}:
+            raise ValueError("Usage: /model thinking <off|low|high|max>")
+        return "thinking", level
+    if any(character.isspace() for character in arguments):
+        raise ValueError("Usage: /model <model-name>")
+    return "model", arguments
+
+
 def clear_input_buffer(event) -> None:
     """Clear the current prompt without submitting it."""
     event.current_buffer.reset()
 
 
+async def wait_for_escape() -> None:
+    """Wait for Esc while the Agent owns the terminal input."""
+    loop = asyncio.get_running_loop()
+    pressed = loop.create_future()
+    terminal_input = create_input()
+
+    def input_ready() -> None:
+        for key_press in terminal_input.read_keys():
+            if key_press.key == Keys.Escape and not pressed.done():
+                pressed.set_result(None)
+
+    try:
+        with terminal_input.attach(input_ready):
+            await pressed
+    finally:
+        terminal_input.close()
+
+
 class SlashCommandCompleter(Completer):
-    def __init__(self, session_provider=None, active_session_provider=None) -> None:
+    def __init__(
+        self,
+        session_provider=None,
+        active_session_provider=None,
+        model_provider=None,
+    ) -> None:
         self.session_provider = session_provider or (lambda: [])
         self.active_session_provider = active_session_provider or (lambda: "")
+        self.model_provider = model_provider or (
+            lambda: ("deepseek-v4-flash", "enabled", "high")
+        )
 
     def get_completions(self, document: Document, complete_event):
         value = document.text_before_cursor
@@ -119,6 +188,47 @@ class SlashCommandCompleter(Completer):
                 emitted += 1
                 if emitted >= MAX_VISIBLE_COMPLETIONS:
                     break
+            return
+        if value.startswith("/model "):
+            remainder = value[7:]
+            current_model, thinking, effort = self.model_provider()
+            current_level = "off" if thinking == "disabled" else effort
+            if remainder.lower().startswith("thinking "):
+                query = remainder[9:].strip().lower()
+                for level in THINKING_LEVELS:
+                    if query and not level.startswith(query):
+                        continue
+                    marker = "● " if level == current_level else ""
+                    yield Completion(
+                        level,
+                        start_position=-len(remainder[9:]),
+                        display=f"{marker}{level}",
+                        display_meta="current" if level == current_level else "thinking level",
+                    )
+                return
+
+            query = remainder.strip().lower()
+            options = [
+                ("thinking ", "Configure thinking: off, low, high, max"),
+                *[
+                    (
+                        model,
+                        "current model" if model == current_model else "DeepSeek model",
+                    )
+                    for model in KNOWN_DEEPSEEK_MODELS
+                ],
+            ]
+            for option, description in options:
+                searchable = option.strip().lower()
+                if query and not searchable.startswith(query):
+                    continue
+                marker = "● " if searchable == current_model.lower() else ""
+                yield Completion(
+                    option,
+                    start_position=-len(remainder),
+                    display=f"{marker}{option.strip()}",
+                    display_meta=description,
+                )
             return
         if not value.startswith("/") or any(character.isspace() for character in value):
             return
@@ -366,6 +476,12 @@ async def run_cli(args: argparse.Namespace) -> int:
         max_tool_output_chars=settings.max_tool_output_chars,
     )
     renderer = RichRenderer(workspace, console)
+    renderer.set_session(active_session.name, active_session.session_id)
+    renderer.set_model(
+        provider.settings.model,
+        provider.settings.thinking,
+        provider.settings.reasoning_effort,
+    )
     context = ContextManager(
         max_chars=settings.max_context_chars,
         max_tool_output_chars=settings.max_tool_output_chars,
@@ -379,7 +495,12 @@ async def run_cli(args: argparse.Namespace) -> int:
         context=context,
         events=renderer,
     )
-    controller.restore_session(active_session.messages, active_session.plan)
+    controller.restore_session(
+        active_session.messages,
+        active_session.plan,
+        paused_task=active_session.paused_task,
+        corrections=active_session.corrections,
+    )
     renderer.restore_errors(active_session.errors)
 
     def save_current_session() -> None:
@@ -391,6 +512,8 @@ async def run_cli(args: argparse.Namespace) -> int:
         ]
         active_session.plan = plan_to_records(plan.steps)
         active_session.errors = [dict(record) for record in renderer.error_records]
+        active_session.paused_task = controller.current_task if controller.is_paused else ""
+        active_session.corrections = controller.corrections if controller.is_paused else []
         try:
             session_store.save(active_session, active=True)
         except OSError as exc:
@@ -414,13 +537,29 @@ async def run_cli(args: argparse.Namespace) -> int:
         }
     )
     key_bindings = KeyBindings()
+    paused_abort_requested = False
 
     @key_bindings.add("enter")
     def submit_non_blank(event) -> None:
         if event.current_buffer.text.strip():
             event.current_buffer.validate_and_handle()
 
-    @key_bindings.add("escape", "escape")
+    @key_bindings.add(
+        "escape",
+        filter=Condition(lambda: controller.is_paused),
+        eager=True,
+    )
+    def abandon_paused_task(event) -> None:
+        nonlocal paused_abort_requested
+        controller.abandon_paused()
+        paused_abort_requested = True
+        event.app.exit(result="")
+
+    @key_bindings.add(
+        "escape",
+        "escape",
+        filter=Condition(lambda: not controller.is_paused),
+    )
     def clear_input(event) -> None:
         clear_input_buffer(event)
 
@@ -430,6 +569,11 @@ async def run_cli(args: argparse.Namespace) -> int:
         completer=SlashCommandCompleter(
             session_provider=session_store.list,
             active_session_provider=lambda: active_session.session_id,
+            model_provider=lambda: (
+                provider.settings.model,
+                provider.settings.thinking,
+                provider.settings.reasoning_effort,
+            ),
         ),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
@@ -455,7 +599,41 @@ async def run_cli(args: argparse.Namespace) -> int:
         )
 
     renderer.banner(settings.model)
-    renderer.state_changed(AgentState.READY, plan)
+    renderer.state_changed(controller.state, plan)
+
+    async def run_agent(operation) -> None:
+        renderer.start_status(plan)
+        try:
+            agent_task = asyncio.create_task(operation)
+            escape_task = asyncio.create_task(wait_for_escape())
+            done, _ = await asyncio.wait(
+                {agent_task, escape_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if escape_task in done and not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    pass
+                controller.pause()
+                renderer.warning(
+                    "Task paused by Esc. Add corrections, then use /continue; press Esc again to abandon."
+                )
+            else:
+                escape_task.cancel()
+                try:
+                    await escape_task
+                except asyncio.CancelledError:
+                    pass
+                await agent_task
+        except KeyboardInterrupt:
+            controller.pause()
+            renderer.warning(
+                "Task paused. Add corrections, then use /continue; press Esc again to abandon."
+            )
+        finally:
+            save_current_session()
+            renderer.stop_status()
 
     while True:
         try:
@@ -477,13 +655,21 @@ async def run_cli(args: argparse.Namespace) -> int:
             console.print("[yellow]Input cancelled.[/yellow]")
             continue
 
+        if paused_abort_requested:
+            paused_abort_requested = False
+            save_current_session()
+            console.print(
+                "[yellow]Paused task abandoned.[/yellow] Existing file changes were preserved."
+            )
+            continue
+
         if not value:
             continue
         if value == "/exit":
             save_current_session()
             break
         if value == "/help":
-            console.print(HELP)
+            console.print(help_table())
             continue
         if value == "/plan":
             renderer.plan_changed(plan)
@@ -491,18 +677,54 @@ async def run_cli(args: argparse.Namespace) -> int:
         if value == "/diff":
             renderer.show_diff(workspace.diff())
             continue
-        if value == "/undo":
-            restored = workspace.undo()
-            if restored:
-                console.print("[green]Restored:[/green] " + ", ".join(restored))
-            else:
-                console.print("[dim]No current-task changes to restore.[/dim]")
+        if value == "/clear":
+            console.clear()
             continue
-        if value == "/session":
-            console.print(
-                f"Session {active_session.session_id} · {active_session.name} · "
-                f"cwd: {workspace.cwd_relative}"
+        if value == "/model" or value.startswith("/model "):
+            if controller.state not in {
+                AgentState.READY,
+                AgentState.PAUSED,
+                AgentState.COMPLETED,
+                AgentState.FAILED,
+                AgentState.WAITING,
+            }:
+                console.print("[yellow]Pause the current task before changing models.[/yellow]")
+                continue
+            try:
+                action, requested = parse_model_command(value)
+                if action == "model":
+                    provider.configure(model=requested)
+                elif action == "thinking":
+                    if requested == "off":
+                        provider.configure(thinking="disabled")
+                    else:
+                        provider.configure(
+                            thinking="enabled", reasoning_effort=requested
+                        )
+            except ValueError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
+                continue
+            renderer.set_model(
+                provider.settings.model,
+                provider.settings.thinking,
+                provider.settings.reasoning_effort,
             )
+            renderer.state_changed(controller.state, plan)
+            thinking_label = (
+                "off"
+                if provider.settings.thinking == "disabled"
+                else provider.settings.reasoning_effort
+            )
+            console.print(
+                f"model:    {provider.settings.model}\n"
+                f"thinking: {thinking_label}"
+            )
+            continue
+        if value == "/continue":
+            if not controller.is_paused:
+                console.print("[yellow]There is no paused task.[/yellow]")
+                continue
+            await run_agent(controller.resume())
             continue
         if value == "/error" or value.startswith("/error "):
             error_id = value[6:].strip() or None
@@ -532,6 +754,7 @@ async def run_cli(args: argparse.Namespace) -> int:
                 continue
             active_session.name_source = USER_NAME_SOURCE
             save_current_session()
+            renderer.set_session(active_session.name, active_session.session_id)
             console.print(f"[green]Session renamed: {active_session.name}[/green]")
             continue
         if value == "/new" or value.startswith("/new "):
@@ -545,6 +768,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             workspace.cwd = workspace.root
             controller.reset_session()
             renderer.restore_errors([])
+            renderer.set_session(active_session.name, active_session.session_id)
             renderer.state_changed(AgentState.READY, plan)
             console.print(f"[green]New session: {active_session.session_id} · {active_session.name}[/green]")
             continue
@@ -568,10 +792,16 @@ async def run_cli(args: argparse.Namespace) -> int:
             save_current_session()
             active_session = target_session
             restore_workspace_state(active_session)
-            controller.restore_session(active_session.messages, active_session.plan)
+            controller.restore_session(
+                active_session.messages,
+                active_session.plan,
+                paused_task=active_session.paused_task,
+                corrections=active_session.corrections,
+            )
             renderer.restore_errors(active_session.errors)
+            renderer.set_session(active_session.name, active_session.session_id)
             session_store.set_active(active_session.session_id)
-            renderer.state_changed(AgentState.READY, plan)
+            renderer.state_changed(controller.state, plan)
             console.print(f"[green]Switched to: {active_session.session_id} · {active_session.name}[/green]")
             continue
         if value.startswith("!"):
@@ -636,21 +866,21 @@ async def run_cli(args: argparse.Namespace) -> int:
             console.print(f"[yellow]Unknown command: {value}[/yellow]")
             continue
 
+        if controller.is_paused:
+            controller.add_correction(value)
+            save_current_session()
+            console.print(
+                "[green]Correction recorded.[/green] "
+                "Use /continue to resume, or press Esc to abandon the paused task."
+            )
+            continue
+
         if active_session.name_source == DEFAULT_NAME_SOURCE:
             active_session.name = derive_session_name(value)
             active_session.name_source = DERIVED_NAME_SOURCE
+            renderer.set_session(active_session.name, active_session.session_id)
 
-        renderer.start_status(plan)
-        try:
-            try:
-                await controller.run(value)
-            except KeyboardInterrupt:
-                controller.state = AgentState.PAUSED
-                renderer.state_changed(AgentState.PAUSED, plan)
-                renderer.warning("Task interrupted; current file changes were preserved.")
-        finally:
-            save_current_session()
-            renderer.stop_status()
+        await run_agent(controller.run(value))
 
     console.print("[dim]Goodbye.[/dim]")
     return 0

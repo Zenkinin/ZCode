@@ -115,6 +115,8 @@ class SessionSnapshot:
     messages: list[Message] = field(default_factory=list)
     plan: list[dict[str, object]] = field(default_factory=list)
     errors: list[dict[str, object]] = field(default_factory=list)
+    paused_task: str = ""
+    corrections: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +161,8 @@ class SessionStore:
                 "created_at": snapshot.created_at,
                 "updated_at": snapshot.updated_at,
                 "cwd": snapshot.cwd,
+                "paused_task": snapshot.paused_task,
+                "corrections": snapshot.corrections,
             }
         ]
         records.extend(
@@ -205,6 +209,8 @@ class SessionStore:
                     )
                 ),
                 cwd=str(meta.get("cwd", ".")),
+                paused_task=str(meta.get("paused_task", "")),
+                corrections=[str(item) for item in meta.get("corrections", [])],
             )
             for record in records[1:]:
                 if record.get("type") == "message":

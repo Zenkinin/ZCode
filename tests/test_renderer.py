@@ -78,6 +78,20 @@ def test_renderer_status_uses_session_working_directory(tmp_path):
     assert "cwd: OPPO 互联" in renderer.status_text().plain
 
 
+def test_renderer_status_contains_current_session(tmp_path):
+    renderer = RichRenderer(tmp_path, Console(file=StringIO(), force_terminal=False))
+    renderer.set_session("修复登录", "s-12345678")
+
+    assert "session: 修复登录" in renderer.status_text().plain
+
+
+def test_renderer_status_contains_model_and_thinking(tmp_path):
+    renderer = RichRenderer(tmp_path, Console(file=StringIO(), force_terminal=False))
+    renderer.set_model("deepseek-v4-flash", "enabled", "high")
+
+    assert "model: deepseek-v4-flash/high" in renderer.status_text().plain
+
+
 def test_renderer_animates_only_active_states(tmp_path):
     renderer = RichRenderer(tmp_path, Console(file=StringIO(), force_terminal=False))
     plan = PlanManager()

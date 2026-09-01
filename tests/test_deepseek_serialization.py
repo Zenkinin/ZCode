@@ -36,6 +36,18 @@ def test_deepseek_tool_result_includes_call_id():
     }
 
 
+def test_deepseek_provider_runtime_configuration(tmp_path):
+    provider = DeepSeekProvider.__new__(DeepSeekProvider)
+    provider.settings = Settings(workspace=tmp_path, api_key="test-key")
+
+    provider.configure(model="deepseek-chat", thinking="disabled")
+    provider.configure(thinking="enabled", reasoning_effort="max")
+
+    assert provider.settings.model == "deepseek-chat"
+    assert provider.settings.thinking == "enabled"
+    assert provider.settings.reasoning_effort == "max"
+
+
 class FakeCompletions:
     def __init__(self):
         self.request = None

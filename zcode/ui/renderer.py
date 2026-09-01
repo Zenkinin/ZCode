@@ -52,6 +52,22 @@ class RichRenderer(EventSink):
         self._git_label = self._git_status()
         self._status_live: Live | None = None
         self.error_records: list[dict[str, object]] = []
+        self._session_name = "—"
+        self._session_id = ""
+        self._model = "—"
+        self._thinking = "—"
+
+    def set_session(self, name: str, session_id: str) -> None:
+        self._session_name = name
+        self._session_id = session_id
+        if self._status_live is not None:
+            self._status_live.update(self, refresh=True)
+
+    def set_model(self, model: str, thinking: str, reasoning_effort: str) -> None:
+        self._model = model
+        self._thinking = "off" if thinking == "disabled" else reasoning_effort
+        if self._status_live is not None:
+            self._status_live.update(self, refresh=True)
 
     def banner(self, model: str) -> None:
         body = (
@@ -87,7 +103,10 @@ class RichRenderer(EventSink):
             progress = f"{active_plan.completed_count}/{active_plan.total_count}"
         primary = f"{symbol} {state.value}"
         cwd = self.workspace_state.cwd_relative if self.workspace_state else "."
-        details = f" │ cwd: {cwd} │ git: {self._git_label} │ plan {progress}"
+        details = (
+            f" │ model: {self._model}/{self._thinking} │ session: {self._session_name} │ cwd: {cwd} "
+            f"│ git: {self._git_label} │ plan {progress}"
+        )
         return primary, details
 
     @staticmethod

@@ -10,11 +10,13 @@ from rich.console import Console
 from zcode.cli import (
     SlashCommandCompleter,
     clear_input_buffer,
+    help_table,
     input_frame_bottom,
     input_frame_close,
     input_body_rows,
     input_frame_top,
     persistent_cd_target,
+    parse_model_command,
     session_choices,
     sessions_table,
     submitted_input_text,
@@ -34,15 +36,81 @@ def test_slash_completer_lists_commands_and_filters_prefix():
     all_commands = {item.text for item in completions_for("/")}
     help_matches = [item.text for item in completions_for("/he")]
 
-    assert {"/help", "/plan", "/diff", "/undo", "/exit"} <= all_commands
-    assert {"/switch", "/error", "/errors"} <= all_commands
-    assert {"/cd", "/cwd"}.isdisjoint(all_commands)
+    assert {"/help", "/plan", "/diff", "/exit"} <= all_commands
+    assert {
+        "/switch",
+        "/error",
+        "/errors",
+        "/clear",
+        "/continue",
+        "/model",
+    } <= all_commands
+    assert {"/cd", "/cwd", "/session", "/undo", "/restart"}.isdisjoint(
+        all_commands
+    )
     assert help_matches == ["/help"]
 
 
 def test_slash_completer_ignores_natural_language_and_arguments():
     assert completions_for("help") == []
     assert completions_for("/help now") == []
+
+
+def test_model_command_parses_model_and_thinking_levels():
+    assert parse_model_command("/model") == ("show", None)
+    assert parse_model_command("/model deepseek-v4-flash") == (
+        "model",
+        "deepseek-v4-flash",
+    )
+    assert parse_model_command("/model thinking off") == ("thinking", "off")
+    assert parse_model_command("/model thinking max") == ("thinking", "max")
+
+
+def test_model_command_rejects_invalid_effort_and_spaced_model():
+    import pytest
+
+    with pytest.raises(ValueError, match="off.*low.*high.*max"):
+        parse_model_command("/model thinking medium")
+    with pytest.raises(ValueError, match="model-name"):
+        parse_model_command("/model model with spaces")
+
+
+def test_model_completer_offers_models_and_thinking_navigation():
+    completer = SlashCommandCompleter(
+        model_provider=lambda: ("deepseek-chat", "enabled", "high")
+    )
+
+    root = completions_for("/model ", completer)
+    thinking = completions_for("/model thinking ", completer)
+
+    assert [item.text for item in root] == [
+        "thinking ",
+        "deepseek-v4-flash",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
+    assert "●" in str(root[2].display)
+    assert [item.text for item in thinking] == ["off", "low", "high", "max"]
+    assert "●" in str(thinking[2].display)
+
+
+def test_model_completer_filters_models_and_thinking_levels():
+    completer = SlashCommandCompleter()
+
+    assert [item.text for item in completions_for("/model deepseek-r", completer)] == [
+        "deepseek-reasoner"
+    ]
+    assert [item.text for item in completions_for("/model thinking m", completer)] == [
+        "max"
+    ]
+
+
+def test_help_table_uses_fixed_command_and_description_widths():
+    table = help_table()
+
+    assert table.title is None
+    assert table.columns[0].width == 40
+    assert table.columns[1].width == 46
 
 
 def test_switch_completer_lists_and_filters_sessions():
