@@ -9,7 +9,7 @@ from zcode.tools.filesystem import (
     SearchTextTool,
     WriteFileTool,
 )
-from zcode.tools.shell import RunCommandTool
+from zcode.tools.shell import RunCommandTool, classify_command
 from zcode.tools.navigation import ChangeDirectoryTool
 from zcode.workspace import Workspace, WorkspaceViolation
 
@@ -124,6 +124,39 @@ async def test_run_command_uses_powershell_and_preserves_unicode(tmp_path):
     assert result.success
     assert "中文" in result.content
     assert "not recognized" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_run_command_blocks_destructive_command_without_confirmation(tmp_path):
+    workspace = Workspace(tmp_path)
+
+    result = await RunCommandTool(workspace, timeout_seconds=5).execute(
+        {"command": "Remove-Item -Recurse -Force target"}
+    )
+
+    assert not result.success
+    assert result.error_code == "confirmation_required"
+    assert result.metadata["risk"] == "destructive"
+
+
+def test_shell_risk_classification_covers_git_and_delete_commands():
+    assert classify_command("git reset --hard HEAD").level == "destructive"
+    assert classify_command("Remove-Item target -Recurse").level == "destructive"
+    assert classify_command("python -m pytest -q").level == "normal"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell behavior is Windows-specific")
+async def test_run_command_preserves_chinese_python_argument(tmp_path):
+    workspace = Workspace(tmp_path)
+    executable = f'& "{sys.executable}"'
+
+    result = await RunCommandTool(workspace, timeout_seconds=5).execute(
+        {"command": f'{executable} -c "import sys; print(sys.argv[1])" "任务内容"'}
+    )
+
+    assert result.success
+    assert "任务内容" in result.content
 
 
 @pytest.mark.asyncio

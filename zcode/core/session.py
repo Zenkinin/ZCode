@@ -114,6 +114,7 @@ class SessionSnapshot:
     cwd: str = "."
     messages: list[Message] = field(default_factory=list)
     plan: list[dict[str, object]] = field(default_factory=list)
+    errors: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +166,7 @@ class SessionStore:
             for message in snapshot.messages
         )
         records.append({"type": "plan", "steps": snapshot.plan})
+        records.append({"type": "errors", "items": snapshot.errors})
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:
                 for record in records:
@@ -212,6 +214,11 @@ class SessionStore:
                     if not isinstance(steps, list):
                         raise TypeError("plan steps must be a list")
                     snapshot.plan = [dict(step) for step in steps]
+                elif record.get("type") == "errors":
+                    items = record.get("items", [])
+                    if not isinstance(items, list):
+                        raise TypeError("errors must be a list")
+                    snapshot.errors = [dict(item) for item in items]
             return snapshot
         except (KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, SessionCorrupt):

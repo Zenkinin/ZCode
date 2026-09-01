@@ -42,6 +42,33 @@ def test_renderer_treats_tool_output_as_plain_text(tmp_path):
     assert "[folder] <DIR> file_name" in output
 
 
+def test_renderer_collapses_and_restores_error_output(tmp_path):
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, width=120)
+    renderer = RichRenderer(tmp_path, console)
+    call = ToolCall("call-1", "run_command", {"command": "tests"}, "{}")
+
+    renderer.tool_finished(
+        call,
+        ToolResult(
+            False,
+            "exit_code: 1\nstdout:\nfirst\nsecond\nthird\nfourth\nstderr:\nsk-secret-example123456",
+            metadata={"exit_code": 1},
+        ),
+    )
+
+    collapsed = stream.getvalue()
+    assert "error e-001" in collapsed
+    assert "Use /error e-001" in collapsed
+    assert "fourth" not in collapsed
+    assert renderer.error_records[0]["content"].endswith("sk-[REDACTED]")
+
+    stream.seek(0)
+    stream.truncate(0)
+    assert renderer.show_error("e-001")
+    assert "fourth" in stream.getvalue()
+
+
 def test_renderer_status_uses_session_working_directory(tmp_path):
     (tmp_path / "OPPO 互联").mkdir()
     workspace = Workspace(tmp_path)

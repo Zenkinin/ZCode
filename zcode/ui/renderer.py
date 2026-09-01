@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+import re
 from pathlib import Path
 
 from rich.console import Console, ConsoleOptions, RenderResult
@@ -9,6 +10,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 from zcode.core.events import EventSink
@@ -49,6 +51,7 @@ class RichRenderer(EventSink):
         self._last_plan: PlanManager | None = None
         self._git_label = self._git_status()
         self._status_live: Live | None = None
+        self.error_records: list[dict[str, object]] = []
 
     def banner(self, model: str) -> None:
         body = (
@@ -151,7 +154,19 @@ class RichRenderer(EventSink):
 
     def tool_finished(self, call: ToolCall, result: ToolResult) -> None:
         if not result.success:
-            self.console.print(Text("  ✕ " + result.content, style="red"))
+            error_id = self._record_error(call, result)
+            exit_code = result.metadata.get("exit_code")
+            heading = f"  ✕ {call.name}"
+            if exit_code is not None:
+                heading += f" · exit_code: {exit_code}"
+            heading += f" · error {error_id}"
+            self.console.print(Text(heading, style="red"))
+            summary = str(self.error_records[-1]["summary"])
+            if summary:
+                self.console.print(Text("    " + summary, style="red dim"))
+            self.console.print(
+                Text(f"    Use /error {error_id} for full output", style="dim")
+            )
             return
         if call.name in {"edit_file", "write_file"} and result.content.startswith("---"):
             self.console.print(Syntax(result.content, "diff", theme="ansi_dark", word_wrap=True))
@@ -191,6 +206,74 @@ class RichRenderer(EventSink):
             self.console.print("[dim]No changes recorded for the current task.[/dim]")
             return
         self.console.print(Syntax(diff, "diff", theme="ansi_dark", word_wrap=True))
+
+    def restore_errors(self, records: list[dict[str, object]]) -> None:
+        self.error_records = [dict(record) for record in records]
+
+    def show_error(self, error_id: str | None = None) -> bool:
+        record = None
+        if error_id:
+            record = next(
+                (item for item in self.error_records if item.get("id") == error_id),
+                None,
+            )
+        elif self.error_records:
+            record = self.error_records[-1]
+        if record is None:
+            return False
+        self.console.print(
+            Panel(
+                Text(str(record.get("content", ""))),
+                title=f"Error {record.get('id', '')}",
+                border_style="red",
+                expand=False,
+            )
+        )
+        return True
+
+    def show_errors(self) -> None:
+        if not self.error_records:
+            self.console.print("[dim]No errors recorded in this session.[/dim]")
+            return
+        table = Table(box=None, show_edge=False, pad_edge=False)
+        table.add_column("ID", style="red", no_wrap=True)
+        table.add_column("TOOL", style="bold", no_wrap=True)
+        table.add_column("SUMMARY", overflow="ellipsis")
+        for record in reversed(self.error_records):
+            table.add_row(
+                str(record.get("id", "")),
+                str(record.get("tool", "")),
+                str(record.get("summary", "")),
+            )
+        self.console.print(table)
+
+    def _record_error(self, call: ToolCall, result: ToolResult) -> str:
+        next_number = 1
+        if self.error_records:
+            try:
+                next_number = int(str(self.error_records[-1].get("id", "e-000"))[2:]) + 1
+            except ValueError:
+                next_number = len(self.error_records) + 1
+        error_id = f"e-{next_number:03d}"
+        content = self._redact_secrets(result.content)
+        useful_lines = [line.strip() for line in content.splitlines() if line.strip()]
+        summary = " · ".join(useful_lines[:3])
+        if len(summary) > 240:
+            summary = summary[:239] + "…"
+        self.error_records.append(
+            {
+                "id": error_id,
+                "tool": call.name,
+                "summary": summary,
+                "content": content,
+                "exit_code": result.metadata.get("exit_code"),
+            }
+        )
+        return error_id
+
+    @staticmethod
+    def _redact_secrets(value: str) -> str:
+        return re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "sk-[REDACTED]", value)
 
     def _git_status(self) -> str:
         try:

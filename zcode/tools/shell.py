@@ -5,11 +5,37 @@ import locale
 import os
 import signal
 import subprocess
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from zcode.core.types import ToolDefinition, ToolResult
 from zcode.tools.base import Tool
 from zcode.workspace import Workspace
+
+
+@dataclass(frozen=True, slots=True)
+class CommandRisk:
+    level: str
+    reason: str = ""
+
+
+DESTRUCTIVE_PATTERNS = (
+    (r"(?i)\bremove-item\b[^\r\n]*(?:-recurse|-force)", "recursive or forced deletion"),
+    (r"(?i)\b(?:rmdir|rd)\b[^\r\n]*/s\b", "recursive directory deletion"),
+    (r"(?i)\bdel\b[^\r\n]*/s\b", "recursive file deletion"),
+    (r"(?i)\bgit\s+reset\s+--hard\b", "Git history/worktree reset"),
+    (r"(?i)\bgit\s+clean\b[^\r\n]*-[a-z]*f", "forced Git clean"),
+    (r"(?i)\bgit\s+checkout\s+--\s+", "discarding file changes"),
+    (r"(?i)\bgit\s+push\b[^\r\n]*(?:--force|-f\b)", "forced Git push"),
+)
+
+
+def classify_command(command: str) -> CommandRisk:
+    for pattern, reason in DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, command):
+            return CommandRisk("destructive", reason)
+    return CommandRisk("normal")
 
 
 def _trim_output(value: str, limit: int) -> str:
@@ -57,6 +83,15 @@ class RunCommandTool(Tool):
         command = arguments.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ValueError("'command' must be a non-empty string")
+        risk = classify_command(command)
+        if risk.level == "destructive" and not arguments.get("_confirmed"):
+            return ToolResult(
+                False,
+                "Destructive command blocked pending explicit user confirmation. "
+                f"Reason: {risk.reason}. Command: {command}",
+                error_code="confirmation_required",
+                metadata={"risk": risk.level, "risk_reason": risk.reason},
+            )
         cwd = self.workspace.resolve(str(arguments.get("cwd", ".")), must_exist=True)
         if not cwd.is_dir():
             raise ValueError("'cwd' must be a directory")
@@ -87,6 +122,11 @@ class RunCommandTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=creationflags,
+                env={
+                    **os.environ,
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
             )
             output_encoding = "utf-8"
         else:
@@ -96,6 +136,11 @@ class RunCommandTool(Tool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=start_new_session,
+                env={
+                    **os.environ,
+                    "PYTHONUTF8": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
             )
             output_encoding = locale.getpreferredencoding(False)
         try:

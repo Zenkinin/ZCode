@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from uuid import uuid4
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,9 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.shortcuts import yes_no_dialog
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
@@ -39,6 +42,7 @@ from zcode.core.session import (
 from zcode.core.types import AgentState, ToolCall
 from zcode.llm.deepseek import DeepSeekProvider
 from zcode.tools.defaults import build_default_registry
+from zcode.tools.shell import classify_command
 from zcode.ui.renderer import RichRenderer
 from zcode.workspace import Workspace
 
@@ -50,9 +54,13 @@ HELP = """[bold]Commands[/bold]
 /undo  Restore files changed by the current task
 /new [name]  Create a new conversation session
 /sessions  List sessions in this workspace
-/switch <id>  Switch to a session
+/switch [id]  Select or switch to a session
 /session  Show the current session
 /rename <name>  Rename the current session
+/cwd  Show workspace, cwd, and Git root
+/cd <path>  Change the persistent session directory
+/error [id]  Show full output for an error
+/errors  List errors in the current session
 !cmd   Run a shell command directly (PowerShell on Windows)
 /exit  Exit ZCode
 """
@@ -64,16 +72,53 @@ SLASH_COMMANDS = {
     "/undo": "Restore current-task changes",
     "/new": "Create a new conversation session",
     "/sessions": "List workspace sessions",
-    "/switch": "Switch to a session",
+    "/switch": "Select or switch to a session",
     "/session": "Show current session",
     "/rename": "Rename the current session",
+    "/cwd": "Show current directories",
+    "/cd": "Change persistent session directory",
+    "/error": "Show full error output",
+    "/errors": "List session errors",
     "/exit": "Exit ZCode",
 }
 
+MAX_VISIBLE_COMPLETIONS = 8
+PREFERRED_INPUT_BODY_ROWS = 8
+
+
+def input_body_rows(terminal_height: int) -> int:
+    """Keep the prompt above the terminal edge without overwhelming short terminals."""
+    return min(PREFERRED_INPUT_BODY_ROWS, max(4, terminal_height // 4))
+
 
 class SlashCommandCompleter(Completer):
+    def __init__(self, session_provider=None, active_session_provider=None) -> None:
+        self.session_provider = session_provider or (lambda: [])
+        self.active_session_provider = active_session_provider or (lambda: "")
+
     def get_completions(self, document: Document, complete_event):
         value = document.text_before_cursor
+        if value.startswith("/switch "):
+            query = value[8:].strip().lower()
+            active_id = self.active_session_provider()
+            emitted = 0
+            for summary in self.session_provider():
+                searchable = f"{summary.session_id} {summary.name} {summary.cwd}".lower()
+                if query and query not in searchable:
+                    continue
+                marker = "● " if summary.session_id == active_id else ""
+                yield Completion(
+                    summary.session_id,
+                    start_position=-len(value[8:]),
+                    display=_truncate_display(f"{marker}{summary.name}", 30),
+                    display_meta=_truncate_display(
+                        f"{summary.session_id} · {summary.cwd}", 36
+                    ),
+                )
+                emitted += 1
+                if emitted >= MAX_VISIBLE_COMPLETIONS:
+                    break
+            return
         if not value.startswith("/") or any(character.isspace() for character in value):
             return
         prefix = value.lower()
@@ -211,6 +256,34 @@ def sessions_table(
     return table
 
 
+def session_choices(
+    summaries: list[SessionSummary], active_session_id: str
+) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    for summary in summaries:
+        marker = "●" if summary.session_id == active_session_id else " "
+        label = (
+            f"{marker} {summary.name[:28]:<28}  {summary.session_id}  "
+            f"{summary.cwd[:28]:<28}  {summary.updated_at[:16]}"
+        )
+        choices.append((summary.session_id, label))
+    return choices
+
+
+def persistent_cd_target(command: str) -> str | None:
+    """Return a path for a simple cd command; reject compound shell syntax."""
+    stripped = command.strip()
+    if any(operator in stripped for operator in (";", "|", "&&", "||")):
+        return None
+    match = re.fullmatch(r"(?i)(?:cd|set-location)\s+(.+)", stripped)
+    if not match:
+        return None
+    target = match.group(1).strip()
+    if len(target) >= 2 and target[0] == target[-1] and target[0] in {'\"', "'"}:
+        target = target[1:-1]
+    return target or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ZCode local coding agent")
     parser.add_argument("workspace", nargs="?", default=".", help="Workspace directory")
@@ -306,6 +379,7 @@ async def run_cli(args: argparse.Namespace) -> int:
         events=renderer,
     )
     controller.restore_session(active_session.messages, active_session.plan)
+    renderer.restore_errors(active_session.errors)
 
     def save_current_session() -> None:
         active_session.cwd = workspace.cwd_relative
@@ -315,6 +389,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             if message.role.value != "system"
         ]
         active_session.plan = plan_to_records(plan.steps)
+        active_session.errors = [dict(record) for record in renderer.error_records]
         try:
             session_store.save(active_session, active=True)
         except OSError as exc:
@@ -326,19 +401,35 @@ async def run_cli(args: argparse.Namespace) -> int:
         {
             "bottom-toolbar": "bg:#202020 #a0a0a0 noreverse",
             "input-border": "fg:ansicyan",
+            "completion-menu": "bg:#303030 #f0f0f0",
+            "completion-menu.completion": "bg:#303030 #f0f0f0",
+            "completion-menu.completion.current": "bg:#008080 #ffffff bold",
+            "completion-menu.meta.completion": "bg:#252525 #b0b0b0",
+            "completion-menu.meta.completion.current": "bg:#006060 #ffffff",
             **{
                 f"status-{state.value}": f"fg:{color} bold"
                 for state, color in STATUS_COLORS.items()
             },
         }
     )
+    key_bindings = KeyBindings()
+
+    @key_bindings.add("enter")
+    def submit_non_blank(event) -> None:
+        if event.current_buffer.text.strip():
+            event.current_buffer.validate_and_handle()
+
     session: PromptSession[str] = PromptSession(
         history=FileHistory(str(history_dir / "history")),
         style=prompt_style,
-        completer=SlashCommandCompleter(),
+        completer=SlashCommandCompleter(
+            session_provider=session_store.list,
+            active_session_provider=lambda: active_session.session_id,
+        ),
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
-        erase_when_done=True,
+        erase_when_done=False,
+        key_bindings=key_bindings,
     )
 
     def bottom_toolbar() -> FormattedText:
@@ -368,6 +459,11 @@ async def run_cli(args: argparse.Namespace) -> int:
                     input_prompt,
                     bottom_toolbar=bottom_toolbar,
                     rprompt=FormattedText([("class:input-border", " │")]),
+                    # PromptSession reserves this height even before completion opens
+                    # because complete_while_typing is enabled. This keeps the input
+                    # cursor fixed near the top of a stable input area instead of
+                    # letting it fall onto the terminal's final row.
+                    reserve_space_for_menu=input_body_rows(console.height),
                 )
             ).strip()
         except EOFError:
@@ -376,10 +472,8 @@ async def run_cli(args: argparse.Namespace) -> int:
             console.print("[yellow]Input cancelled.[/yellow]")
             continue
 
-        submitted = submitted_input_text(value, console.width)
-        if submitted is None:
+        if not value:
             continue
-        console.print(submitted)
         if value == "/exit":
             save_current_session()
             break
@@ -404,6 +498,37 @@ async def run_cli(args: argparse.Namespace) -> int:
                 f"Session {active_session.session_id} · {active_session.name} · "
                 f"cwd: {workspace.cwd_relative}"
             )
+            continue
+        if value == "/cwd":
+            git_root = workspace.root
+            console.print(
+                f"workspace: {workspace.root}\n"
+                f"cwd:       {workspace.cwd_relative}\n"
+                f"git root:  {git_root}"
+            )
+            continue
+        if value == "/cd" or value.startswith("/cd "):
+            target = value[3:].strip()
+            if not target:
+                console.print("[yellow]Usage: /cd <path>[/yellow]")
+                continue
+            try:
+                workspace.change_directory(target)
+            except (OSError, ValueError) as exc:
+                console.print(f"[red]Could not change directory: {exc}[/red]")
+                continue
+            save_current_session()
+            renderer.state_changed(AgentState.READY, plan)
+            console.print(f"[green]cwd: {workspace.cwd_relative}[/green]")
+            continue
+        if value == "/error" or value.startswith("/error "):
+            error_id = value[6:].strip() or None
+            if not renderer.show_error(error_id):
+                message = f"Error not found: {error_id}" if error_id else "No errors recorded."
+                console.print(f"[yellow]{message}[/yellow]")
+            continue
+        if value == "/errors":
+            renderer.show_errors()
             continue
         if value == "/sessions":
             summaries = session_store.list()
@@ -436,13 +561,21 @@ async def run_cli(args: argparse.Namespace) -> int:
                 continue
             workspace.cwd = workspace.root
             controller.reset_session()
+            renderer.restore_errors([])
             renderer.state_changed(AgentState.READY, plan)
             console.print(f"[green]New session: {active_session.session_id} · {active_session.name}[/green]")
             continue
         if value == "/switch" or value.startswith("/switch "):
             session_id = value[7:].strip()
             if not session_id:
-                console.print("[yellow]Usage: /switch <session-id>[/yellow]")
+                summaries = session_store.list()
+                if len(summaries) <= 1:
+                    console.print("[dim]No other sessions in this workspace.[/dim]")
+                else:
+                    console.print(sessions_table(summaries, active_session.session_id))
+                    console.print(
+                        "[dim]Type /switch followed by a space, then use ↑/↓ and Enter.[/dim]"
+                    )
                 continue
             try:
                 target_session = session_store.load(session_id)
@@ -453,6 +586,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             active_session = target_session
             restore_workspace_state(active_session)
             controller.restore_session(active_session.messages, active_session.plan)
+            renderer.restore_errors(active_session.errors)
             session_store.set_active(active_session.session_id)
             renderer.state_changed(AgentState.READY, plan)
             console.print(f"[green]Switched to: {active_session.session_id} · {active_session.name}[/green]")
@@ -462,7 +596,40 @@ async def run_cli(args: argparse.Namespace) -> int:
             if not command:
                 console.print("[yellow]Usage: !<command>, for example !ls[/yellow]")
                 continue
+            cd_target = persistent_cd_target(command)
+            if cd_target is not None:
+                try:
+                    workspace.change_directory(cd_target)
+                except (OSError, ValueError) as exc:
+                    console.print(f"[red]Could not change directory: {exc}[/red]")
+                    continue
+                save_current_session()
+                renderer.state_changed(AgentState.READY, plan)
+                console.print(f"[green]cwd: {workspace.cwd_relative}[/green]")
+                continue
+            if re.match(r"(?i)^\s*(?:cd|set-location)\b", command):
+                console.print(
+                    "[yellow]Compound cd commands do not persist. "
+                    "Use /cd <path>, then run the command separately.[/yellow]"
+                )
+                continue
             arguments = {"command": command}
+            risk = classify_command(command)
+            if risk.level == "destructive":
+                confirmed = await yes_no_dialog(
+                    title="Confirm destructive command",
+                    text=(
+                        f"Risk: {risk.reason}\n\n"
+                        f"cwd: {workspace.cwd}\n\n"
+                        f"{command}\n\nRun this command?"
+                    ),
+                    yes_text="Run",
+                    no_text="Cancel",
+                ).run_async()
+                if not confirmed:
+                    console.print("[yellow]Command cancelled.[/yellow]")
+                    continue
+                arguments["_confirmed"] = True
             call = ToolCall(
                 id=f"direct-shell-{uuid4().hex}",
                 name="run_command",

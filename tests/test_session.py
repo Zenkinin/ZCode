@@ -31,6 +31,9 @@ def test_session_store_round_trip_and_active_selection(tmp_path):
     plan = PlanManager()
     plan.create(["Inspect"])
     second.plan = plan_to_records(plan.steps)
+    second.errors = [
+        {"id": "e-001", "tool": "run_command", "summary": "failed", "content": "full"}
+    ]
     store.save(second, active=True)
 
     loaded = store.load_active()
@@ -42,6 +45,7 @@ def test_session_store_round_trip_and_active_selection(tmp_path):
     assert loaded.cwd == "src"
     assert loaded.messages[1].tool_calls[0].name == "read_file"
     assert loaded.plan[0]["description"] == "Inspect"
+    assert loaded.errors[0]["id"] == "e-001"
     assert {item.name for item in store.list()} == {"first", "second"}
     assert (tmp_path / ".zcode" / "sessions" / f"{first.session_id}.jsonl").exists()
 
