@@ -16,6 +16,8 @@ from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 from zcode.config import Settings
 from zcode.credentials import delete_api_key, prompt_and_save_api_key
@@ -29,6 +31,7 @@ from zcode.core.session import (
     SessionCorrupt,
     SessionSnapshot,
     SessionStore,
+    SessionSummary,
     clean_session_name,
     derive_session_name,
     plan_to_records,
@@ -140,6 +143,39 @@ def input_frame_bottom(
 def input_frame_close(width: int) -> str:
     frame_width = max(24, width)
     return "╰" + "─" * (frame_width - 2) + "╯"
+
+
+def sessions_table(
+    summaries: list[SessionSummary],
+    active_session_id: str,
+) -> Table:
+    """Build a compact, display-width-aware session list."""
+    table = Table(
+        box=None,
+        show_edge=False,
+        pad_edge=False,
+        collapse_padding=True,
+        padding=(0, 2),
+    )
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("NAME", min_width=8, max_width=32, overflow="ellipsis", no_wrap=True)
+    table.add_column("CWD", min_width=3, max_width=40, overflow="ellipsis", no_wrap=True)
+    table.add_column("UPDATED", style="dim", no_wrap=True)
+    for summary in summaries:
+        marker = (
+            Text("●", style="green")
+            if summary.session_id == active_session_id
+            else Text(" ")
+        )
+        table.add_row(
+            marker,
+            summary.session_id,
+            summary.name,
+            summary.cwd,
+            summary.updated_at,
+        )
+    return table
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -340,12 +376,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             if not summaries:
                 console.print("[dim]No sessions in this workspace.[/dim]")
             else:
-                for summary in summaries:
-                    marker = "*" if summary.session_id == active_session.session_id else " "
-                    console.print(
-                        f"{marker} {summary.session_id} · {summary.name} · "
-                        f"cwd: {summary.cwd} · updated: {summary.updated_at}"
-                    )
+                console.print(sessions_table(summaries, active_session.session_id))
             continue
         if value == "/rename" or value.startswith("/rename "):
             requested_name = value[7:].strip()
