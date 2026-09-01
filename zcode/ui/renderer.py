@@ -147,6 +147,10 @@ class RichRenderer(EventSink):
         )
         self._status_live.start(refresh=True)
 
+    @property
+    def status_active(self) -> bool:
+        return self._status_live is not None
+
     def stop_status(self) -> None:
         if self._status_live is None:
             return

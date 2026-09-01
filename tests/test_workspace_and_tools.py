@@ -9,7 +9,7 @@ from zcode.tools.filesystem import (
     SearchTextTool,
     WriteFileTool,
 )
-from zcode.tools.shell import RunCommandTool, classify_command
+from zcode.tools.shell import RunCommandTool, classify_command, has_sensitive_target
 from zcode.tools.navigation import ChangeDirectoryTool
 from zcode.workspace import Workspace, WorkspaceViolation
 
@@ -143,6 +143,31 @@ def test_shell_risk_classification_covers_git_and_delete_commands():
     assert classify_command("git reset --hard HEAD").level == "destructive"
     assert classify_command("Remove-Item target -Recurse").level == "destructive"
     assert classify_command("python -m pytest -q").level == "normal"
+
+
+def test_shell_risk_classification_covers_common_force_variants():
+    for command in (
+        "rm -rf build",
+        "Remove-Item cache -Force",
+        "git restore .",
+        "git branch -D old-feature",
+        "git push --force-with-lease",
+        "git rebase main",
+    ):
+        assert classify_command(command).level == "destructive"
+
+
+def test_sensitive_shell_targets_always_require_per_command_confirmation(tmp_path):
+    root = str(tmp_path)
+    for command in (
+        "Remove-Item . -Recurse -Force",
+        "Remove-Item ../other -Recurse -Force",
+        "Remove-Item .git -Recurse -Force",
+        r"Remove-Item C:\outside -Recurse -Force",
+        f'Remove-Item "{root}" -Recurse -Force',
+    ):
+        assert has_sensitive_target(command, root)
+    assert not has_sensitive_target("Remove-Item build -Recurse -Force", root)
 
 
 @pytest.mark.asyncio

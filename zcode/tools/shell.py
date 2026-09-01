@@ -7,7 +7,7 @@ import signal
 import subprocess
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from zcode.core.types import ToolDefinition, ToolResult
 from zcode.tools.base import Tool
@@ -21,13 +21,19 @@ class CommandRisk:
 
 
 DESTRUCTIVE_PATTERNS = (
+    (r"(?i)(?:^|[;&|])\s*rm\s+(?:-[a-z]*f[a-z]*r|-[a-z]*r[a-z]*f)\b", "recursive or forced deletion"),
     (r"(?i)\bremove-item\b[^\r\n]*(?:-recurse|-force)", "recursive or forced deletion"),
+    (r"(?i)\bremove-item\b[^\r\n]*-force", "forced deletion"),
     (r"(?i)\b(?:rmdir|rd)\b[^\r\n]*/s\b", "recursive directory deletion"),
     (r"(?i)\bdel\b[^\r\n]*/s\b", "recursive file deletion"),
     (r"(?i)\bgit\s+reset\s+--hard\b", "Git history/worktree reset"),
     (r"(?i)\bgit\s+clean\b[^\r\n]*-[a-z]*f", "forced Git clean"),
     (r"(?i)\bgit\s+checkout\s+--\s+", "discarding file changes"),
+    (r"(?i)\bgit\s+(?:restore|checkout)\s+(?:\.|--\s*\.)", "discarding file changes"),
+    (r"(?i)\bgit\s+branch\s+-D\b", "force deleting a Git branch"),
     (r"(?i)\bgit\s+push\b[^\r\n]*(?:--force|-f\b)", "forced Git push"),
+    (r"(?i)\bgit\s+push\b[^\r\n]*--force-with-lease", "forced Git push"),
+    (r"(?i)\bgit\s+rebase\b", "rewriting Git history"),
 )
 
 
@@ -36,6 +42,22 @@ def classify_command(command: str) -> CommandRisk:
         if re.search(pattern, command):
             return CommandRisk("destructive", reason)
     return CommandRisk("normal")
+
+
+def has_sensitive_target(command: str, workspace_root: str) -> bool:
+    """Return whether a destructive target needs per-command confirmation."""
+    lowered = command.casefold()
+    if any(token in lowered for token in (".git", ".zcode", ".venv")):
+        return True
+    if workspace_root.casefold() in lowered:
+        return True
+    return bool(
+        re.search(
+            r"(?i)\b(?:remove-item|rm|rmdir|rd|del)\b[^\r\n]*"
+            r"(?:^|\s|['\"])(?:\.{1,2}(?:\s|$|['\"/\\])|[a-z]:[\\/]|\\\\|/)",
+            command,
+        )
+    )
 
 
 def _trim_output(value: str, limit: int) -> str:
@@ -54,10 +76,12 @@ class RunCommandTool(Tool):
         workspace: Workspace,
         timeout_seconds: float = 120.0,
         max_output_chars: int = 20_000,
+        confirm_callback: Callable[[str, CommandRisk, str], Awaitable[str]] | None = None,
     ) -> None:
         self.workspace = workspace
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
+        self.confirm_callback = confirm_callback
         shell_name = "PowerShell" if os.name == "nt" else "the platform shell"
         self.definition = ToolDefinition(
             name="run_command",
@@ -84,17 +108,21 @@ class RunCommandTool(Tool):
         if not isinstance(command, str) or not command.strip():
             raise ValueError("'command' must be a non-empty string")
         risk = classify_command(command)
-        if risk.level == "destructive" and not arguments.get("_confirmed"):
-            return ToolResult(
-                False,
-                "Destructive command blocked pending explicit user confirmation. "
-                f"Reason: {risk.reason}. Command: {command}",
-                error_code="confirmation_required",
-                metadata={"risk": risk.level, "risk_reason": risk.reason},
-            )
         cwd = self.workspace.resolve(str(arguments.get("cwd", ".")), must_exist=True)
         if not cwd.is_dir():
             raise ValueError("'cwd' must be a directory")
+        if risk.level == "destructive" and not arguments.get("_confirmed"):
+            decision = "no"
+            if self.confirm_callback is not None:
+                decision = (await self.confirm_callback(command, risk, str(cwd))).lower()
+            if decision not in {"once", "always"}:
+                return ToolResult(
+                    False,
+                    "Destructive command denied pending explicit user confirmation. "
+                    f"Reason: {risk.reason}. Command: {command}",
+                    error_code="confirmation_required",
+                    metadata={"risk": risk.level, "risk_reason": risk.reason, "decision": "no"},
+                )
         timeout = min(float(arguments.get("timeout_seconds", self.timeout_seconds)), 600.0)
 
         creationflags = 0

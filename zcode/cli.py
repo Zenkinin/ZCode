@@ -18,7 +18,6 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.shortcuts import CompleteStyle
-from prompt_toolkit.shortcuts import yes_no_dialog
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
@@ -45,7 +44,8 @@ from zcode.core.session import (
 from zcode.core.types import AgentState, ToolCall
 from zcode.llm.deepseek import DeepSeekProvider
 from zcode.tools.defaults import build_default_registry
-from zcode.tools.shell import classify_command
+from zcode.tools.shell import classify_command, has_sensitive_target
+from zcode.security import SecurityPolicy
 from zcode.ui.renderer import RichRenderer
 from zcode.workspace import Workspace
 
@@ -65,6 +65,7 @@ HELP_COMMANDS = (
     ("/continue", "Continue a paused task with corrections"),
     ("/error [id]", "Show full output for an error"),
     ("/errors", "List errors in the current session"),
+    ("/safety", "View session and permanent shell approvals"),
     ("!cmd", "Run PowerShell directly without the model"),
     ("/exit", "Exit ZCode"),
 )
@@ -82,6 +83,7 @@ SLASH_COMMANDS = {
     "/continue": "Continue paused task",
     "/error": "Show full error output",
     "/errors": "List session errors",
+    "/safety": "View session and permanent shell approvals",
     "/exit": "Exit ZCode",
 }
 
@@ -475,11 +477,61 @@ async def run_cli(args: argparse.Namespace) -> int:
 
     restore_workspace_state(active_session)
     provider = DeepSeekProvider(settings)
+    always_allowed_risks: set[str] = set()
+    security = SecurityPolicy(workspace.root)
+
+    def sensitive_target(command: str) -> bool:
+        return has_sensitive_target(command, str(workspace.root))
+
+    def print_risk_prompt(command: str, risk, cwd: str) -> None:
+        console.print(
+            f"[bold yellow]⚠ Risk:[/bold yellow] {risk.reason}\n"
+            f"[dim]cwd:[/dim] {cwd}\n"
+            f"[dim]command:[/dim] {command}\n"
+            "[bold green]\\[Y][/bold green] once   "
+            "[bold cyan]\\[A][/bold cyan] session   "
+            "[bold magenta]\\[P][/bold magenta] permanent   "
+            "[bold red]\\[N][/bold red] no"
+        )
+
+    async def confirm_agent_command(command: str, risk, cwd: str) -> str:
+        """Ask before an Agent-issued destructive shell command."""
+        if risk.reason in always_allowed_risks:
+            console.print(
+                f"[dim]✓ Risk auto-approved (\\[A] always): {risk.reason}[/dim]"
+            )
+            return "always"
+        if security.allows(risk.reason) and not sensitive_target(command):
+            console.print(f"[dim]Risk permanently approved: {risk.reason}[/dim]")
+            return "always"
+        print_risk_prompt(command, risk, cwd)
+        was_status_active = renderer.status_active
+        renderer.stop_status()
+        try:
+            answer = (await confirmation_session.prompt_async(
+                "Approve? [Y/A/P/N] "
+            )).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        finally:
+            if was_status_active:
+                renderer.start_status(plan)
+        if answer in {"p", "permanent"}:
+            security.grant(risk.reason)
+            return "always"
+        if answer in {"a", "always"}:
+            always_allowed_risks.add(risk.reason)
+            return "always"
+        if answer in {"y", "yes", "once"}:
+            return "once"
+        return "no"
+
     tools = build_default_registry(
         workspace,
         plan,
         command_timeout_seconds=settings.command_timeout_seconds,
         max_tool_output_chars=settings.max_tool_output_chars,
+        confirm_callback=confirm_agent_command,
     )
     renderer = RichRenderer(workspace, console)
     renderer.set_session(active_session.name, active_session.session_id)
@@ -543,7 +595,25 @@ async def run_cli(args: argparse.Namespace) -> int:
         }
     )
     key_bindings = KeyBindings()
+    confirmation_bindings = KeyBindings()
     paused_abort_requested = False
+
+    @confirmation_bindings.add("y", eager=True)
+    def approve_once(event) -> None:
+        event.app.exit(result="y")
+
+    @confirmation_bindings.add("a", eager=True)
+    def approve_session(event) -> None:
+        event.app.exit(result="a")
+
+    @confirmation_bindings.add("p", eager=True)
+    def approve_permanently(event) -> None:
+        event.app.exit(result="p")
+
+    @confirmation_bindings.add("n", eager=True)
+    @confirmation_bindings.add("escape", eager=True)
+    def deny_command(event) -> None:
+        event.app.exit(result="n")
 
     @key_bindings.add("enter")
     def submit_non_blank(event) -> None:
@@ -589,6 +659,12 @@ async def run_cli(args: argparse.Namespace) -> int:
         # Erase that surface and print a normal Rich render after submission.
         erase_when_done=True,
         key_bindings=key_bindings,
+    )
+    confirmation_session: PromptSession[str] = PromptSession(
+        style=prompt_style,
+        complete_while_typing=False,
+        erase_when_done=True,
+        key_bindings=confirmation_bindings,
     )
 
     def bottom_toolbar() -> FormattedText:
@@ -692,6 +768,33 @@ async def run_cli(args: argparse.Namespace) -> int:
             continue
         if value == "/clear":
             console.clear()
+            continue
+        if value == "/safety" or value.startswith("/safety "):
+            argument = value[7:].strip()
+            if argument in {"reset", "clear"}:
+                security.revoke()
+                console.print("[green]Permanent shell approvals cleared.[/green]")
+            elif argument.startswith("revoke "):
+                risk_name = argument[7:].strip()
+                security.revoke(risk_name)
+                console.print(f"[green]Revoked permanent approval: {risk_name}[/green]")
+            else:
+                console.print(f"workspace: {workspace.root}")
+                session_risks = sorted(always_allowed_risks)
+                permanent_risks = security.risks()
+                console.print("Session approvals (cleared when ZCode exits):")
+                console.print(
+                    "\n".join(f"- {risk}" for risk in session_risks)
+                    if session_risks else "(none)"
+                )
+                console.print("Permanent approvals (this workspace):")
+                console.print(
+                    "\n".join(f"- {risk}" for risk in permanent_risks)
+                    if permanent_risks else "(none)"
+                )
+                console.print(
+                    "Use /safety revoke <risk> or /safety reset to clear permanent approvals."
+                )
             continue
         if value == "/model" or value.startswith("/model "):
             if controller.state not in {
@@ -842,16 +945,8 @@ async def run_cli(args: argparse.Namespace) -> int:
             arguments = {"command": command}
             risk = classify_command(command)
             if risk.level == "destructive":
-                confirmed = await yes_no_dialog(
-                    title="Confirm destructive command",
-                    text=(
-                        f"Risk: {risk.reason}\n\n"
-                        f"cwd: {workspace.cwd}\n\n"
-                        f"{command}\n\nRun this command?"
-                    ),
-                    yes_text="Run",
-                    no_text="Cancel",
-                ).run_async()
+                decision = await confirm_agent_command(command, risk, str(workspace.cwd))
+                confirmed = decision in {"once", "always"}
                 if not confirmed:
                     console.print("[yellow]Command cancelled.[/yellow]")
                     continue

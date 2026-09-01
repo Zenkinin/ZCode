@@ -16,6 +16,7 @@ ZCode 提供一个清晰、可检查的编程闭环：
 - 状态栏实时显示状态、模型、思考模式、会话、cwd、Git 和 Plan 进度。
 - 支持多个持久会话；每个会话独立保存消息、Plan、cwd、错误和暂停状态。
 - 支持 Esc 暂停、输入纠正内容后 `/continue` 恢复执行。
+- 提交后的多行输入会渲染为稳定历史框，适配中英文宽度和 Windows 终端拉伸。
 - 对失败输出生成错误 ID，默认显示摘要，需要时再展开完整内容。
 - 支持运行时切换 DeepSeek 模型和思考配置。
 - 对常见递归删除和危险 Git 命令执行风险检查。
@@ -102,6 +103,9 @@ zcode
 | `/continue` | 根据暂停后的纠正继续原任务 |
 | `/error [id]` | 展开最近或指定错误的完整内容 |
 | `/errors` | 列出当前会话的错误记录 |
+| `/safety` | 查看当前进程和当前 workspace 的 Shell 授权 |
+| `/safety revoke <risk>` | 撤销指定永久授权 |
+| `/safety reset` | 清除当前 workspace 的全部永久授权 |
 | `!<command>` | 不经过模型，直接运行 PowerShell |
 | `/exit` | 保存当前会话并退出 |
 
@@ -218,7 +222,18 @@ Agent 思考或执行时按 Esc，会终止当前模型请求或工具执行并�
 
 文件工具只能访问启动时指定的 workspace，并拒绝访问 workspace 外路径和 `.git`、`.venv`、`.zcode`。
 
-Shell 工具不是操作系统沙箱。模型发起的常见破坏性命令默认被阻止；用户通过 `!` 直接运行时，递归删除、`git reset --hard`、`git clean -f`、强制推送等操作会要求确认。
+Shell 工具不是操作系统沙箱。Agent 发起的 Shell 命令与用户通过 `!` 直接运行的命令使用相同风险检查。递归或强制删除、`git reset --hard`、`git clean -f`、`git restore .`、强制删分支、rebase 和强制推送等操作会暂停执行并要求确认：
+
+```text
+[Y] once   [A] session   [P] permanent   [N] no
+```
+
+- `Y`：只允许当前命令。
+- `A`：本次 ZCode 进程内允许同类风险，退出后清除。
+- `P`：永久允许当前 workspace 内的同类风险。
+- `N` 或 Esc：拒绝当前命令，Agent 可以根据拒绝结果调整方案。
+
+永久授权按“规范化 workspace 路径 + 风险类型”保存到用户级 ZCode 配置，不会写入项目。涉及 `.git`、`.zcode`、`.venv`、workspace 根目录或显式 workspace 完整路径的命令仍会重新确认。使用 `/safety` 可同时查看会话级和永久授权；`/safety revoke <risk>` 与 `/safety reset` 只撤销永久授权。
 
 仍需注意：
 
